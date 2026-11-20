@@ -16,6 +16,9 @@ use crate::{
     sources::Sources,
 };
 
+#[cfg(windows)]
+mod antigravity;
+
 const CODEX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const CODEX_HISTORY_LIMIT: usize = 1200;
 
@@ -99,7 +102,7 @@ impl QuotaCache
                 });
                 codex_quota(&sources.codex_sessions(), cutoff)
             }));
-            let providers = if sources.home_override.is_none() { windows_quota(force, &sources.codex_auth(), tools) }
+            let providers = if sources.home_override.is_none() { windows_quota(&sources.codex_auth(), tools) }
                 else { Providers::default() };
             let (codex, history) = codex.map(|reader| reader.join().expect("Codex quota reader")).unwrap_or_default();
             (codex, providers, history)
@@ -153,7 +156,7 @@ impl Quotas
         self.checked_at = Some(now);
         let previous = |tool| self.tools.iter().find(|quota| quota.tool == tool).cloned();
         let previous_codex = previous("codex");
-        let antigravity = antigravity_quota(providers.antigravity, now);
+        let antigravity = providers.antigravity;
         let deepseek = deepseek_quota(&providers.deepseek, now);
         let bank = parse_banked_reset(&providers.codex_reset, now);
         // Only successful numeric observations enter the history, before fallback to cached rows.
@@ -307,17 +310,10 @@ fn parse_banked_reset(value: &Value, now: i64) -> Option<BankedReset>
 #[serde(default)]
 struct Providers
 {
-    antigravity: Option<Antigravity>,
+    #[serde(skip)]
+    antigravity: Option<ToolQuota>,
     codex_reset: Value,
     deepseek: Value,
-}
-
-#[derive(Deserialize)]
-struct Antigravity
-{
-    plan: Option<String>,
-    summary: Value,
-    configs: Value,
 }
 
 fn array(value: &Value) -> &[Value]
@@ -353,10 +349,10 @@ fn window_minutes(bucket: &Value) -> Option<u64>
 
 fn percent(fraction: f64) -> f64 { (fraction * 100.0).clamp(0.0, 100.0) }
 
-fn antigravity_quota(data: Option<Antigravity>, observed_at: i64) -> Option<ToolQuota>
+fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Option<ToolQuota>
 {
-    let data = data?;
-    let summary = data.summary.get("response").or_else(|| data.summary.get("summary")).unwrap_or(&data.summary);
+    let summary = [&summary["response"], &summary["summary"], summary].into_iter()
+        .find(|value| value.is_object()).unwrap_or(summary);
     let mut windows = Vec::new();
     for group in array(&summary["groups"])
     {
@@ -384,16 +380,22 @@ fn antigravity_quota(data: Option<Antigravity>, observed_at: i64) -> Option<Tool
     }
     if windows.is_empty()
     {
-        for cfg in array(&data.configs)
+        for cfg in array(configs)
         {
             let Some(id) = cfg["modelOrAlias"]["model"].as_str() else { continue };
+            // Legacy model lists also advertise retired placeholders outside the active quota pools.
+            if matches!(id, "" | "MODEL_CHAT_20706" | "MODEL_CHAT_23310" | "MODEL_GOOGLE_GEMINI_2_5_FLASH"
+                | "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING" | "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE"
+                | "MODEL_GOOGLE_GEMINI_2_5_PRO" | "MODEL_PLACEHOLDER_M19" | "MODEL_PLACEHOLDER_M9" | "MODEL_PLACEHOLDER_M12")
+            {
+                continue;
+            }
             let label = cfg["label"].as_str().unwrap_or(id);
             let family = format!("{label} {id}").to_ascii_lowercase();
             let group = if family.contains("argon") { "Gemini 4 Argon" }
                 else if family.contains("gemini") && family.contains("flash") { "Gemini Flash" }
                 else if family.contains("gemini") { "Gemini Pro" }
-                else if family.contains("claude") || family.contains("gpt") { "Claude/GPT" }
-                else { continue };
+                else { "Claude/GPT" };
             let quota = &cfg["quotaInfo"];
             let Some(fraction) = quota["remainingFraction"].as_f64() else { continue };
             let value = QuotaWindow { group: group.to_owned(), minutes: None, remaining: percent(fraction),
@@ -410,7 +412,7 @@ fn antigravity_quota(data: Option<Antigravity>, observed_at: i64) -> Option<Tool
         (rank, window.minutes)
     });
     (!windows.is_empty()).then_some(ToolQuota {
-        tool: "antigravity", plan: data.plan, observed_at, windows, balances: vec![], banked_reset: None,
+        tool: "antigravity", plan: None, observed_at, windows, balances: vec![], banked_reset: None,
     })
 }
 
@@ -427,45 +429,72 @@ fn deepseek_quota(data: &Value, observed_at: i64) -> Option<ToolQuota>
 }
 
 #[cfg(windows)]
-fn windows_quota(force: bool, codex_auth: &Path, tools: ToolSelection) -> Providers
+fn windows_quota(codex_auth: &Path, tools: ToolSelection) -> Providers
+{
+    std::thread::scope(|scope| {
+        // Keep a completed local RPC result even if a remote balance request fails or times out.
+        let local = tools.antigravity.then(|| scope.spawn(antigravity::read));
+        let mut providers = if tools.codex || tools.dsh
+        {
+            let remote_tools = ToolSelection { antigravity: false, ..tools }.enabled().collect::<Vec<_>>().join(",");
+            powershell_json(include_str!("quota_windows.ps1"), &[
+                ("TOKEN_MONITOR_LITE_CODEX_AUTH", codex_auth.as_os_str()),
+                ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", remote_tools.as_ref()),
+            ], Duration::from_secs(13)).unwrap_or_default()
+        }
+        else { Providers::default() };
+        providers.antigravity = local.and_then(|worker| worker.join().expect("Antigravity quota reader"));
+        providers
+    })
+}
+
+#[cfg(windows)]
+fn powershell_json<T: serde::de::DeserializeOwned + Send>(
+    script: &str, vars: &[(&str, &std::ffi::OsStr)], timeout: Duration,
+) -> Option<T>
 {
     use std::{env, os::windows::process::CommandExt, process::{Command, Stdio}, thread};
     use windows_sys::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW};
 
-    let Some(root) = env::var_os("SystemRoot") else { return Providers::default() };
+    let root = env::var_os("SystemRoot")?;
     let powershell = PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let child = Command::new(powershell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", include_str!("quota_windows.ps1")])
-        .env("TOKEN_MONITOR_LITE_FORCE_QUOTA", if force { "1" } else { "0" })
-        .env("TOKEN_MONITOR_LITE_CODEX_AUTH", codex_auth)
-        .env("TOKEN_MONITOR_LITE_QUOTA_TOOLS", tools.enabled().collect::<Vec<_>>().join(","))
+    let mut child = Command::new(powershell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .envs(vars.iter().copied())
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW).spawn();
-    let Ok(mut child) = child else { return Providers::default() };
+        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW).spawn().ok()?;
     let stdout = child.stdout.take().expect("piped quota response");
     thread::scope(|scope| {
-        let reader = scope.spawn(move || serde_json::from_reader(BufReader::new(stdout)).unwrap_or_default());
-        let deadline = Instant::now() + Duration::from_secs(13);
+        let reader = scope.spawn(move || serde_json::from_reader(BufReader::new(stdout)));
+        let deadline = Instant::now() + timeout;
         loop
         {
             match child.try_wait()
             {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(status)) =>
+                {
+                    eprintln!("Windows quota helper exited with {status}.");
+                    return None;
+                }
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
                 _ =>
                 {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break;
+                    eprintln!("Windows quota helper did not finish.");
+                    return None;
                 }
             }
         }
-        reader.join().expect("quota response reader")
+        reader.join().expect("quota response reader").map_err(|err| {
+            eprintln!("Invalid quota helper response at line {}, column {}.", err.line(), err.column());
+        }).ok()
     })
 }
 
 #[cfg(not(windows))]
-fn windows_quota(_: bool, _: &Path, _: ToolSelection) -> Providers { Providers::default() }
+fn windows_quota(_: &Path, _: ToolSelection) -> Providers { Providers::default() }
 
 #[cfg(test)]
 mod tests
@@ -543,14 +572,11 @@ mod tests
         assert_eq!(codex.plan.as_deref(), Some("Pro 100"));
         assert_eq!(codex.windows[0].remaining, 0.0);
         assert_eq!(codex.windows[0].resets_at, Some(1_795_219_200_000));
-        let ag = antigravity_quota(Some(Antigravity {
-            plan: None, configs: Value::Null,
-            summary: json!({"response":{"groups":[{"displayName":"Gemini 4 Argon","buckets":[
+        let ag = antigravity_quota(&json!({"response":{"groups":[{"displayName":"Gemini 4 Argon","buckets":[
                 {"window":"WEEKLY","remaining":{"case":"remainingFraction","value":0.51},"resetTime":"2026-11-27T00:00:00Z"},
                 {"window":"SESSION","remainingFraction":1.0,"disabled":true},
                 {"window":"SESSION"}
-            ]}]}}),
-        }), 0).unwrap();
+            ]}]}}), &Value::Null, 0).unwrap();
         assert_eq!(ag.windows.len(), 1);
         assert_eq!(ag.windows[0].minutes, Some(10_080));
         assert_eq!(ag.windows[0].remaining, 51.0);
