@@ -96,9 +96,20 @@ impl Default for QuotaSettings
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub enum StatisticsRange
+{
+    Week,
+    Last7,
+    #[default]
+    Last30,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Preferences
 {
+    pub statistics_range: StatisticsRange,
     pub collection: CollectionSettings,
     pub quotas: QuotaSettings,
 }
@@ -157,10 +168,25 @@ mod tests
     fn existing_settings_default_to_live_collection_and_all_tools()
     {
         let settings: Preferences = serde_json::from_str(r#"{"quotas":{"tools":{"codex":false}}}"#).unwrap();
+        assert_eq!(settings.statistics_range, StatisticsRange::Last30);
         assert_eq!(settings.collection, CollectionSettings::default());
         assert_eq!(settings.quotas.refresh_minutes, 2);
         assert_eq!(settings.quotas.tools.enabled().collect::<Vec<_>>(), ["antigravity", "dsh"]);
         assert_eq!(settings.collection.tools.scope("today".into()), "today");
         assert_eq!(settings.quotas.tools.scope("today".into()), "today|tools:antigravity,dsh");
+    }
+
+    #[test]
+    fn statistics_range_matches_the_period_keys_in_saved_settings()
+    {
+        for (range, key) in [
+            (StatisticsRange::Week, "week"), (StatisticsRange::Last7, "last7"), (StatisticsRange::Last30, "last30"),
+        ]
+        {
+            let settings = Preferences { statistics_range: range, ..Preferences::default() };
+            let serialized = serde_json::to_value(settings).unwrap();
+            assert_eq!(serialized["statisticsRange"], key);
+            assert_eq!(serde_json::from_value::<Preferences>(serialized).unwrap(), settings);
+        }
     }
 }

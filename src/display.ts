@@ -1,4 +1,4 @@
-import type { Counts, RequestPerformance, Session, Usage, View } from './api';
+import type { Counts, RequestPerformance, Session, StatisticsRange, Usage, View } from './api';
 import codex from './icons/providers/codex.svg?url';
 import antigravity from './icons/providers/antigravity.svg?url';
 import dsh from './icons/providers/dsh.svg?url';
@@ -19,6 +19,9 @@ import gemini from './icons/providers/gemini.svg?url';
 
 export const zh = navigator.language.toLowerCase().startsWith('zh');
 export const local = (english: string, chinese: string) => zh ? chinese : english;
+export const statisticsRangeLabels: Record<StatisticsRange, string> = {
+  week: local('WEEK', '本周'), last7: '7D', last30: '30D'
+};
 export const icons = { home, tools, models, sessions, limits, trends, refresh, settings, appearance, collection, search, back, spinner };
 export const views: View[] = ['home', 'limits', 'tools', 'models', 'sessions'];
 export const viewLabel: Record<View, string> = {
@@ -147,7 +150,7 @@ export function sessionModelsTitle(session: Session): string
 export const effortTitle = (effort: string) => local('Reasoning effort ', '思考等级 ') + effort;
 export const outputRateLabel = (rate: number | null) => rate != null && Math.round(rate) > 0 ? number(Math.round(rate)) + ' tok/s' : '';
 
-export function requestPerformanceParts(performance: RequestPerformance | null)
+export function requestPerformanceParts(performance: RequestPerformance | null, tool: string)
 {
   if (!performance) return [];
   const { tokensPerSecond, firstTokenMs, hiddenReasoning } = performance;
@@ -168,10 +171,12 @@ export function requestPerformanceParts(performance: RequestPerformance | null)
   if (firstTokenMs != null)
   {
     const duration = firstTokenMs < 1000 ? number(firstTokenMs) + ' ms' : (firstTokenMs / 1000).toFixed(1) + ' s';
+    const logLabel = tool === 'antigravity'
+      ? local('First-token wait recorded by Antigravity', 'Antigravity 日志记录的首字等待时间')
+      : local('Log estimate includes client request preparation', '从日志时间戳推算，含客户端组装请求的时间');
     parts.push({
       value: local('First token ', '首字 ') + prefix + duration,
-      label: estimated ? local('Log estimate includes client request preparation', '从日志时间戳推算，含客户端组装请求的时间') :
-        local('Time from router receipt to first upstream output', '从路由服务收到请求到上游开始输出')
+      label: estimated ? logLabel : local('Time from router receipt to first upstream output', '从路由服务收到请求到上游开始输出')
     });
   }
   return parts;
@@ -190,7 +195,7 @@ export function callLabel(count: number): string
   return local(`${number(count)} ${count === 1 ? 'call' : 'calls'}`, `${number(count)} 次调用`);
 }
 
-export function sessionActivityParts(session: Session, now: number, view: 'preview' | 'list' | 'detail' = 'list')
+export function sessionActivityParts(session: Session, now: number, view: 'preview' | 'list' = 'list')
 {
   const { calls, tokensPerSecond, startedAt } = session.metrics;
   return [
@@ -198,7 +203,7 @@ export function sessionActivityParts(session: Session, now: number, view: 'previ
     { value: view === 'preview' ? '' : shortSessionTime(session.lastUsedAt ?? startedAt, now), label: local('Last used', '最近活动') },
     { value: calls ? callLabel(calls) : '', label: '' },
     { value: cacheHitLabel(session.usage.counts), label: local('Cache hit', '缓存命中') },
-    { value: view === 'detail' ? '' : outputRateLabel(tokensPerSecond), label: local('Generation rate', '生成速率') }
+    { value: outputRateLabel(tokensPerSecond), label: local('Average session generation rate', '会话平均生成速率') }
   ].filter(part => part.value);
 }
 

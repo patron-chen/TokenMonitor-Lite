@@ -10,7 +10,7 @@ Token Monitor Lite 受 Token Monitor 启发，是按个人的 Windows 本机用�
 
 1. 解压完整 ZIP，运行 `TokenMonitorLite.exe`。详情窗口依赖 Microsoft Edge WebView2 Evergreen Runtime。
 2. 托盘悬停查看简写的今日 Token 和估算成本。左键在托盘图标旁打开或关闭详情，点到窗口之外时详情自动收起。右键打开、刷新、退出。窗口使用圆角裁切的 Windows 原生毛玻璃，系统材质不可用时显示半透明渐变。右下角齿轮打开设置，按 Esc 返回原来的视图。
-3. 右上切换 `DAY / MONTH / TOTAL`。再次点击选中的中间页签可选本月、本周、近 7 天或近 30 天。会话支持今日、本月、全部。
+3. 右上切换 `DAY / 30D / TOTAL`。在「设置 → 采集 → 统计范围」选择本周、`7D` 或 `30D`，设置会保存到本机并用于中间页签。本周按系统的周首日计算，`7D` 和 `30D` 均包含今天。会话支持今日、本月、全部。
 4. 左下点击当前视图依次切换主页、额度、工具、模型、会话，箭头直接选页。首页额度区任意位置可进入额度页，点工具名可定位到对应工具。工具页展示 Token 用量，工具、模型和提示摘要均可展开。会话支持按工具筛选、搜索和翻页，全页 Token 用 K／M／B 简写。
 
 窗口较矮时，可用滚轮或触控板滚动内容。
@@ -19,9 +19,9 @@ Token Monitor Lite 受 Token Monitor 启发，是按个人的 Windows 本机用�
 
 在首页「活动」中悬停某天，可查看以 K／M／B 简写的当日 Token 总量。
 
-首页最近会话把可用的模型、思考等级、时间、调用次数、缓存命中和生成速率排在同一行。Codex 的上下文占用取自最近一次请求，活跃会话结束一段时间后收起。展开提示摘要可查看逐轮明细，可点击会话 ID 复制。费用显示在会话层。
+首页最近会话把可用的模型、思考等级、时间、调用次数、缓存命中和生成速率排在同一行。会话列表和详情顶部显示当前周期的会话平均生成速率。Codex 的上下文占用取自最近一次请求，活跃会话结束一段时间后收起。展开提示摘要可查看逐轮明细，可点击会话 ID 复制。费用显示在会话层。
 
-逐轮计时可读取本机 CC Switch 数据库中与响应 ID 对应的路由记录。路由速率取首字到结束，输出至少 100 Token 才显示。思考未外露且有推理计数时，速率注明近似。日志估算以 `≈` 标记，速率含首字等待，输出至少 200 Token 才显示。日志含有相应时间点时才显示估算首字。Codex 需要新版日志的输出项开始时间，开头直接调用工具时省略首字估算。
+逐轮计时可读取本机 CC Switch 数据库中与响应 ID 对应的路由记录。路由速率取首字到结束，输出至少 100 Token 才显示。思考未外露且有推理计数时，速率注明近似。日志估算以 `≈` 标记，速率含首字等待，输出至少 200 Token 才显示。Antigravity 使用 SQLite 记录的首字等待与后续输出耗时。Codex 需要新版日志的输出项开始时间，开头直接调用工具时省略首字估算。
 
 费用是 API 价格估算。部分模型或 Token 项缺价时显示已计价小计，全部缺价时显示暂无估价。价格快照取自 2026-11-20（北京时间）的 [LiteLLM 模型价表](https://github.com/BerriAI/litellm/blob/3e00b708d12ebddfaff33e046d3cc647d3c1f012/model_prices_and_context_window.json)。
 
@@ -50,8 +50,8 @@ Token Monitor Lite 受 Token Monitor 启发，是按个人的 Windows 本机用�
 同步 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的应用版本并提交。推送与版本匹配的 `v` 标签后，Actions 会在 Windows x64 上执行检查和打包，将 `Token-Monitor-Lite-<版本>-win-x64.zip` 上传到对应的 GitHub Release。
 
 ```powershell
-git tag -a v0.1.13 -m "Token Monitor Lite 0.1.13"
-git push origin v0.1.13
+git tag -a v0.1.15 -m "Token Monitor Lite 0.1.15"
+git push origin v0.1.15
 ```
 
 重新运行可补传缺少的 ZIP，并复用已有同名资产。带预发行后缀的版本发布为 Pre-release。

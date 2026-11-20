@@ -72,9 +72,10 @@ fn read_database(
             .or_else(|| response.and_then(|id| steps.response_index.get(id).copied()))
             .or_else(|| steps.generation_index.get(&index).copied());
         let step = step_id.and_then(|id| steps.by_index.get(&id));
-        let started_at = bytes(chat, 9).and_then(|time| bytes(time, 4)).and_then(timestamp);
-        let at = started_at
-            .or_else(|| step.and_then(|step| step.time)).or(fallback);
+        // Recent IDE records put the generation clock on the linked planner step.
+        let recorded_at = bytes(chat, 9).and_then(|time| bytes(time, 4)).and_then(timestamp)
+            .or_else(|| step.and_then(|step| step.time));
+        let at = recorded_at.or(fallback);
         if let Some((id, (prompt_at, prompt))) = step_id.and_then(|id| steps.prompts.range(..id).next_back())
         {
             if last_prompt != Some(*id)
@@ -87,7 +88,7 @@ fn read_database(
             .map(model_alias).map(str::to_owned)
             .or_else(|| (models.len() == 1 && models[0] != "unknown").then(|| models[0].clone()));
         let tools = step.map(|step| step.tools.clone()).unwrap_or_default();
-        let timing = started_at.and_then(|_| generation_timing(chat));
+        let timing = recorded_at.and_then(|_| generation_timing(chat));
         let mut turn = Turn::new(at, model, tools, counts, "reply").with_timing(timing);
         turn.response_id = response.map(str::to_owned);
         conversation.add(span, turn, step_id.is_none() || last_prompt.is_none());
@@ -322,6 +323,14 @@ mod tests
         let step = [b(1, &v(1, timestamp)), b(9, &b(11, b"fixture-response"))].concat();
         writer.execute("INSERT INTO steps VALUES (1,15,?1,?2)", rusqlite::params![step,planner]).unwrap();
         writer.execute("INSERT INTO gen_metadata VALUES (0,?1)", [b(1, &chat)]).unwrap();
+        // Recent IDE rows carry the clock on the linked planner step.
+        let usage = [v(2, 20), v(3, 225), v(9, 5), v(10, 220)].concat();
+        let chat = [b(4, &usage), b(9, &b(2, &v(1, 42))),
+            b(11, &[v(1, 1), v(2, 250_000_000)].concat()),
+            b(12, &[v(1, 1), v(2, 750_000_000)].concat())].concat();
+        let gen = [b(1, &chat), b(2, &var(7))].concat();
+        writer.execute("INSERT INTO steps VALUES (7,15,?1,NULL)", [b(1, &v(1, timestamp + 5))]).unwrap();
+        writer.execute("INSERT INTO gen_metadata VALUES (1,?1)", [gen]).unwrap();
         let now = DateTime::<Utc>::from_timestamp(timestamp as i64, 0).unwrap();
         let span = Span::new(Period::Today, now, chrono_tz::Asia::Shanghai, Weekday::Mon);
         let mut conversation = Conversation::default();
@@ -332,6 +341,10 @@ mod tests
         assert_eq!(turn.model.as_deref(), Some("gemini-3.5-flash-high"));
         assert_eq!(turn.timing, super::super::TranscriptTiming::from_elapsed(1000, Some(250)));
         assert_eq!(turn.tools, ["list_directory"]);
+        let modern = &conversation.exchanges[0].turns[1];
+        assert_eq!(modern.at, Some((timestamp as i64 + 5) * 1000));
+        assert_eq!(modern.counts.output, Some(220));
+        assert_eq!(modern.timing, super::super::TranscriptTiming::from_elapsed(3000, Some(1250)));
         drop(writer);
         let _ = fs::remove_file(path);
     }

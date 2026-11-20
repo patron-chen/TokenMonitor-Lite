@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 export type Period = 'today' | 'month' | 'week' | 'last7' | 'last30' | 'allTime';
-export type CenterPeriod = Exclude<Period, 'today' | 'allTime'>;
+export type StatisticsRange = Extract<Period, 'week' | 'last7' | 'last30'>;
 export type View = 'home' | 'limits' | 'tools' | 'models' | 'sessions';
 export type Sort = 'newest' | 'tokens';
 export type ToolMode = 'tokens' | 'models';
@@ -15,6 +15,7 @@ export type SettingsSection = 'appearance' | 'collection' | 'quotas';
 
 export interface Preferences
 {
+  statisticsRange: StatisticsRange;
   collection: { cadence: Cadence; tools: ToolSelection };
   quotas: { refreshMinutes: number; tools: ToolSelection };
 }
@@ -30,6 +31,7 @@ export interface CollectionStatus
 }
 
 export const defaultPreferences: Preferences = {
+  statisticsRange: 'last30',
   collection: { cadence: 'live', tools: { codex: true, antigravity: true, dsh: true } },
   quotas: { refreshMinutes: 2, tools: { codex: true, antigravity: true, dsh: true } }
 };
@@ -187,7 +189,6 @@ export interface Detail
 export interface ViewState
 {
   period: Period;
-  center: CenterPeriod;
   view: View;
   fromHome: boolean;
   tool: string | null;

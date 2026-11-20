@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { backend, defaultPreferences, emptySessions, pageSize, toolIds } from './api';
-  import type { Activity, Appearance, Backdrop, CenterPeriod, CollectionStatus, Detail, Period,
-    Preferences, Quotas, Session, SessionKey, SettingsSection, Summary, View, ViewState } from './api';
+  import type { Activity, Appearance, Backdrop, CollectionStatus, Detail, Period,
+    Preferences, Quotas, Session, SessionKey, SettingsSection, StatisticsRange, Summary, View, ViewState } from './api';
   import { cacheHitLabel, callLabel, compact, cost, effortTitle, icons, local, modelIcon, number, requestPerformanceParts,
-    sessionActivityParts, sessionKey, sessionModelLabel, sessionTitle, shortSessionTime, splits, time, toolInfo, viewLabel, views, zh } from './display';
+    sessionActivityParts, sessionKey, sessionModelLabel, sessionTitle, shortSessionTime, splits,
+    statisticsRangeLabels, time, toolInfo, viewLabel, views, zh } from './display';
   import BreakdownRows from './BreakdownRows.svelte';
   import HomeHistory from './HomeHistory.svelte';
   import QuotaSection from './QuotaSection.svelte';
@@ -16,17 +17,8 @@
   import SettingsPanel from './SettingsPanel.svelte';
   import './styles.css';
 
-  const periods: Record<Period, string> = {
-    today: 'DAY', month: 'MONTH', week: 'WEEK', last7: '7D', last30: '30D', allTime: 'TOTAL'
-  };
-  const middleOptions: { id: CenterPeriod; label: string }[] = [
-    { id: 'month', label: local('This month', '本月') },
-    { id: 'week', label: local('This week', '本周') },
-    { id: 'last7', label: local('Last 7 days', '近 7 天') },
-    { id: 'last30', label: local('Last 30 days', '近 30 天') }
-  ];
   const initial: ViewState = {
-    period: 'today', center: 'month', view: 'home', fromHome: false, tool: null, query: '',
+    period: 'today', view: 'home', fromHome: false, tool: null, query: '',
     searchOpen: false, page: 0, scroll: 0, selection: null, sort: 'newest',
     detailPage: 0, detailScroll: 0, openExchanges: [], expanded: null, toolMode: 'tokens'
   };
@@ -62,7 +54,6 @@
   let error = $state('');
   let detailError = $state('');
   let loadingDetail = $state(false);
-  let periodMenu = $state(false);
   let viewMenu = $state(false);
   let summaryRequest = 0;
   let listRequest = 0;
@@ -74,7 +65,6 @@
   let held = false;
   let viewport: HTMLElement | undefined = $state();
   let heroNumber: HTMLDivElement | undefined = $state();
-  let middleButton: HTMLButtonElement | undefined = $state();
   let disclosure: HTMLButtonElement | undefined = $state();
   let searchButton: HTMLButtonElement | undefined = $state();
   let searchInput: HTMLInputElement | undefined = $state();
@@ -84,6 +74,7 @@
   let filterStart = $state(true);
   let filterEnd = $state(true);
   let periodSlot = $derived(route.period === 'today' ? 0 : (route.period === 'allTime' ? 2 : 1));
+  let middlePeriod = $derived<'month' | StatisticsRange>(route.view === 'sessions' ? 'month' : preferences.statisticsRange);
   let hasSessions = $derived(route.period === 'today' || route.period === 'month' || route.period === 'allTime');
   let maxSession = $derived(Math.max(1, ...sessions.rows.map(row => row.usage.tokens)));
   let maxExchange = $derived(Math.max(1, ...(detail?.exchanges.map(exchange => exchange.tokens) ?? [])));
@@ -140,10 +131,15 @@
     try
     {
       const previous = await backend.view();
-      if (previous.view) route = { ...initial, ...previous.view };
+      preferences = { ...defaultPreferences, ...previous.preferences };
+      if (previous.view)
+      {
+        route = { ...initial, ...previous.view };
+        if (periodSlot === 1) route.period = middlePeriod;
+        if (!hasSessions) route.selection = null;
+      }
       backdrop = previous.backdrop;
       appearance = previous.appearance;
-      preferences = previous.preferences ?? defaultPreferences;
       quotas = previous.cachedQuotas ?? null;
       lastQuotaCheck = quotas?.checkedAt ?? 0;
       ready = true;
@@ -266,7 +262,6 @@
     if (!settingsOpen)
     {
       captureScroll();
-      periodMenu = false;
       viewMenu = false;
       settingsOpen = true;
       selectSettingsSection(settingsSection);
@@ -295,6 +290,7 @@
     try
     {
       await backend.preferences($state.snapshot(next), route.period);
+      if (periodSlot === 1 && route.period !== middlePeriod) await choosePeriod(middlePeriod, true);
       if (toolIds.some(tool => next.collection.tools[tool] !== previous.collection.tools[tool]))
       {
         activityRequest++;
@@ -368,7 +364,7 @@
     try
     {
       const data = await backend.summary(period);
-      if (request !== summaryRequest) return;
+      if (request !== summaryRequest || period !== route.period) return;
       const changed = summary?.updatedAt !== data.updatedAt;
       summary = data;
       if (period === 'today') updateActivityToday(data);
@@ -379,7 +375,7 @@
     }
     catch
     {
-      if (request === summaryRequest) error = local('Could not read local usage.', '无法读取本地用量。');
+      if (request === summaryRequest && period === route.period) error = local('Could not read local usage.', '无法读取本地用量。');
     }
   }
 
@@ -465,12 +461,10 @@
     if (viewport) viewport.scrollTop = 0;
   }
 
-  async function choosePeriod(period: Period)
+  async function choosePeriod(period: Period, rememberImmediately = false)
   {
-    periodMenu = false;
     if (period === route.period) return;
     route.period = period;
-    if (period !== 'today' && period !== 'allTime') route.center = period;
     route.page = 0;
     route.detailPage = 0;
     route.openExchanges = [];
@@ -479,7 +473,7 @@
     detail = null;
     if (!hasSessions) route.selection = null;
     resetViewport();
-    remember();
+    void remember(rememberImmediately);
     try
     {
       if (period !== 'today') await backend.refresh(period);
@@ -489,30 +483,6 @@
     {
       error = local('Could not refresh this period.', '无法刷新该周期。');
     }
-  }
-
-  function middleClick()
-  {
-    if (periodSlot === 1) void setPeriodMenu(!periodMenu, 'current');
-    else void choosePeriod(route.center);
-  }
-
-  async function setPeriodMenu(open: boolean, focus: 'current' | 'first' | 'last')
-  {
-    periodMenu = open;
-    if (open)
-    {
-      await tick();
-      const buttons = document.querySelectorAll<HTMLButtonElement>('#period-menu button');
-      const active = document.querySelector<HTMLButtonElement>('#period-menu [aria-checked="true"]');
-      (focus === 'current' ? active : focus === 'last' ? buttons[buttons.length - 1] : buttons[0])?.focus();
-    }
-  }
-
-  async function selectMiddle(period: CenterPeriod)
-  {
-    await choosePeriod(period);
-    middleButton?.focus();
   }
 
   async function chooseView(view: View, fromHome = false, expanded: string | null = null)
@@ -531,10 +501,14 @@
     }
     detail = null;
     detailRequest++;
-    resetViewport();
-    void remember(true);
     loadViewExtras();
-    if (view === 'home' || view === 'sessions') await loadSessions().catch(showListError);
+    if (periodSlot === 1 && route.period !== middlePeriod) await choosePeriod(middlePeriod, true);
+    else
+    {
+      resetViewport();
+      void remember(true);
+      if (view === 'home' || view === 'sessions') await loadSessions().catch(showListError);
+    }
     if (fromHome)
     {
       await tick();
@@ -582,14 +556,12 @@
     {
       event.preventDefault();
       event.stopPropagation();
-      periodMenu = false;
       viewMenu = false;
       restore?.focus();
       return;
     }
     if (event.key === 'Tab')
     {
-      periodMenu = false;
       viewMenu = false;
       return;
     }
@@ -608,19 +580,13 @@
   function outside(event: MouseEvent)
   {
     const target = event.target as Element | null;
-    if (!target?.closest('[data-period-control]')) periodMenu = false;
     if (!target?.closest('[data-view-control]')) viewMenu = false;
   }
 
   function escape(event: KeyboardEvent)
   {
     if (event.key !== 'Escape') return;
-    if (periodMenu)
-    {
-      periodMenu = false;
-      middleButton?.focus();
-    }
-    else if (viewMenu)
+    if (viewMenu)
     {
       viewMenu = false;
       disclosure?.focus();
@@ -781,29 +747,14 @@
     <div class="brand" data-tauri-drag-region title="Token Monitor Lite">
       <span data-tauri-drag-region>Σ</span><span class="live-dot" class:online={summary?.updatedAt && !summary.failure} aria-hidden="true"></span>
     </div>
-    <div class="period-control" data-period-control>
-      <nav class="tabs" aria-label={local('Period tabs', '统计周期')} style:--period-index={periodSlot}>
-        <span class="tab-indicator" aria-hidden="true"></span>
-        <button class="tab" aria-pressed={periodSlot === 0} onclick={() => choosePeriod('today')}>DAY</button>
-        <button class="tab" bind:this={middleButton} aria-pressed={periodSlot === 1} aria-haspopup="menu"
-          aria-controls="period-menu" aria-expanded={periodMenu} onclick={middleClick} onkeydown={(event) => {
-            if (event.key === 'ArrowDown' || event.key === 'ArrowUp')
-            {
-              event.preventDefault();
-              void setPeriodMenu(true, event.key === 'ArrowUp' ? 'last' : 'first');
-            }
-          }}>{periods[route.center]}</button>
-        <button class="tab" aria-pressed={periodSlot === 2} onclick={() => choosePeriod('allTime')}>TOTAL</button>
-      </nav>
-      {#if periodMenu}
-        <div class="glass-menu period-menu" id="period-menu" role="menu" tabindex="-1" aria-label={local('Fixed periods', '固定时间范围')}
-          onkeydown={event => menusKeydown(event, middleButton)}>
-          {#each middleOptions as option (option.id)}
-            <button role="menuitemradio" aria-checked={route.center === option.id} onclick={() => selectMiddle(option.id)}>{option.label}</button>
-          {/each}
-        </div>
-      {/if}
-    </div>
+    <nav class="tabs" aria-label={local('Period tabs', '统计周期')} style:--period-index={periodSlot}>
+      <span class="tab-indicator" aria-hidden="true"></span>
+      <button class="tab" aria-pressed={periodSlot === 0} onclick={() => choosePeriod('today')}>DAY</button>
+      <button class="tab" aria-pressed={periodSlot === 1} onclick={() => choosePeriod(middlePeriod)}>
+        {middlePeriod === 'month' ? 'MONTH' : statisticsRangeLabels[middlePeriod]}
+      </button>
+      <button class="tab" aria-pressed={periodSlot === 2} onclick={() => choosePeriod('allTime')}>TOTAL</button>
+    </nav>
     {/if}
     <div class="window-controls">
       <button class="window-button" onclick={dismiss} aria-label={local('Minimize to tray', '最小化到托盘')}>−</button>
@@ -909,7 +860,7 @@
           </div>
           <div class="session-head-line">
             <span class="row-meta session-detail-activity">
-              {#each sessionActivityParts(session, now, 'detail') as part, index (part.label)}
+              {#each sessionActivityParts(session, now) as part, index (part.label)}
                 {#if index > 0}{' · '}{/if}<span title={part.label || undefined}>{part.value}</span>
               {/each}
             </span>
@@ -934,7 +885,7 @@
             {#if route.openExchanges.includes(exchange.id)}
               <ol class="turns">
                 {#each exchange.turns as turn, index}
-                  {@const performance = requestPerformanceParts(turn.performance)}
+                  {@const performance = requestPerformanceParts(turn.performance, session.tool)}
                   {@const hit = cacheHitLabel(turn.counts, turn.counts.cacheRead != null || turn.counts.cacheWrite != null)}
                   {@const title = turn.kind === 'attempt' ? local('Attempt', '尝试') :
                     turn.kind === 'compaction' ? local('Compaction', '压缩总结') : local('AI Reply', 'AI 回复')}

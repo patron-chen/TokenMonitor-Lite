@@ -1,8 +1,8 @@
 <script lang="ts">
   import { toolIds } from './api';
   import type { Snippet } from 'svelte';
-  import type { Appearance, Backdrop, Cadence, CollectionStatus, Preferences, SettingsSection, ToolId } from './api';
-  import { compact, icons, local, number, time, toolInfo } from './display';
+  import type { Appearance, Backdrop, Cadence, CollectionStatus, Preferences, SettingsSection, StatisticsRange, ToolId } from './api';
+  import { compact, icons, local, number, statisticsRangeLabels, time, toolInfo } from './display';
 
   interface Props
   {
@@ -165,6 +165,18 @@
             </div>
             {#if errors.appearance}<p class="settings-note error" role="status">{local('Could not save appearance.', '无法保存外观设置。')}</p>{/if}
           {:else if open && tab.id === 'collection'}
+            <div class="settings-item">
+              <label for="statistics-range">{local('Statistics range', '统计范围')}</label>
+              <select id="statistics-range" value={preferences.statisticsRange} disabled={busy.settings}
+                aria-describedby="statistics-range-note" onchange={event => setPreferences({
+                  ...preferences, statisticsRange: event.currentTarget.value as StatisticsRange
+                })}>
+                {#each Object.entries(statisticsRangeLabels) as [value, label] (value)}<option {value}>{label}</option>{/each}
+              </select>
+              <p id="statistics-range-note" class="settings-note">
+                {local('Token totals on the middle period tab.', '用于右上角中间页签的 Token 汇总。')}
+              </p>
+            </div>
             <div class="settings-item">
               <label for="collection-cadence">{local('Collection frequency', '采集频率')}</label>
               <select id="collection-cadence" value={preferences.collection.cadence} disabled={busy.settings}
