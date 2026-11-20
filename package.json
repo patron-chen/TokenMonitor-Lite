@@ -1,0 +1,31 @@
+{
+  "name": "token-monitor-lite",
+  "version": "0.1.12",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "predev": "npm run ensure:tokscale",
+    "dev": "tauri dev",
+    "web:dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "ensure:tokscale": "node scripts/tokscale.cjs",
+    "dist:win": "node scripts/package.cjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.0",
+    "svelte": "^5.58.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "@tauri-apps/cli": "^2.12.6",
+    "@tsconfig/svelte": "^5.0.7",
+    "svelte-check": "^4.7.8",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.6"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  }
+}
