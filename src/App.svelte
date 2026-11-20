@@ -2,10 +2,11 @@
   import { onMount, tick } from 'svelte';
   import { backend, defaultPreferences, emptySessions, pageSize, toolIds } from './api';
   import type { Activity, Appearance, Backdrop, CollectionStatus, Detail, Period,
-    Preferences, Quotas, Session, SessionKey, SettingsSection, StatisticsRange, Summary, View, ViewState } from './api';
+    Preferences, Quotas, Session, SessionKey, SettingsSection, StatisticsRange, Summary, UiLanguage, View, ViewState } from './api';
   import { cacheHitLabel, callLabel, compact, cost, effortTitle, icons, local, modelIcon, number, requestPerformanceParts,
     sessionActivityParts, sessionKey, sessionModelLabel, sessionTitle, shortSessionTime, splits,
-    statisticsRangeLabels, time, toolInfo, viewLabel, views, zh } from './display';
+    statisticsRangeTabLabels, time, toolInfo, viewLabel, views } from './display';
+  import { isChinese, setLanguage } from './language.svelte';
   import BreakdownRows from './BreakdownRows.svelte';
   import HomeHistory from './HomeHistory.svelte';
   import QuotaSection from './QuotaSection.svelte';
@@ -30,6 +31,7 @@
   let backdrop = $state<Backdrop>('none');
   let appearance = $state<Appearance>({ opacity: 88, fontScale: 100 });
   let preferences = $state<Preferences>(defaultPreferences);
+  let systemLanguage = $state<UiLanguage>();
   let settingsOpen = $state(false);
   let settingsSection = $state<SettingsSection | null>('appearance');
   let settingsButton: HTMLButtonElement | undefined = $state();
@@ -50,9 +52,9 @@
   let quotaRequest = 0;
   let lastQuotaCheck = $state(0);
   let now = $state(Date.now());
-  let copyResult = $state<{ key: string; label: string } | null>(null);
-  let error = $state('');
-  let detailError = $state('');
+  let copyResult = $state<{ key: string; copied: boolean } | null>(null);
+  let error = $state<[string, string] | null>(null);
+  let detailError = $state<[string, string] | null>(null);
   let loadingDetail = $state(false);
   let viewMenu = $state(false);
   let summaryRequest = 0;
@@ -88,6 +90,8 @@
   let shownQuotas = $derived(quotas && {
     ...quotas, tools: quotas.tools.filter(provider => preferences.quotas.tools[provider.tool])
   });
+
+  $effect(() => setLanguage(preferences.language, systemLanguage));
 
   $effect(() => {
     document.documentElement.style.setProperty('--ui-text-scale', String(appearance.fontScale / 100));
@@ -126,7 +130,6 @@
   });
 
   onMount(() => {
-    document.documentElement.lang = zh ? 'zh-CN' : 'en';
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
     backend.updated(period => {
@@ -155,6 +158,7 @@
     {
       const previous = await backend.view();
       preferences = { ...defaultPreferences, ...previous.preferences };
+      systemLanguage = previous.systemLanguage;
       if (previous.view)
       {
         route = { ...initial, ...previous.view };
@@ -175,7 +179,7 @@
     catch
     {
       ready = true;
-      error = local('Could not open the local usage view.', '无法打开本地用量视图。');
+      error = ['Could not open the local usage view.', '无法打开本地用量视图。'];
     }
   }
 
@@ -391,14 +395,14 @@
       const changed = summary?.updatedAt !== data.updatedAt;
       summary = data;
       if (period === 'today') updateActivityToday(data);
-      error = '';
+      error = null;
       if (fromUpdate && !changed) return;
       if (route.selection && hasSessions) await loadDetail(fromUpdate);
       else if (route.view === 'home' || route.view === 'sessions') await loadSessions();
     }
     catch
     {
-      if (request === summaryRequest && period === route.period) error = local('Could not read local usage.', '无法读取本地用量。');
+      if (request === summaryRequest && period === route.period) error = ['Could not read local usage.', '无法读取本地用量。'];
     }
   }
 
@@ -438,11 +442,11 @@
     try
     {
       await navigator.clipboard.writeText(value);
-      copyResult = { key, label: local('Copied', '已复制') };
+      copyResult = { key, copied: true };
     }
     catch
     {
-      copyResult = { key, label: local('Could not copy ID', '无法复制 ID') };
+      copyResult = { key, copied: false };
     }
   }
 
@@ -453,7 +457,7 @@
     const offset = keepPosition ? viewport?.scrollTop ?? route.detailScroll : route.detailScroll;
     const selection = route.selection;
     const period = route.period;
-    detailError = '';
+    detailError = null;
     loadingDetail = !keepPosition;
     try
     {
@@ -462,14 +466,14 @@
       detail = data;
       if (!data && summary?.updatedAt)
       {
-        detailError = local('No activity in this period.', '该周期内没有这条会话的用量。');
+        detailError = ['No activity in this period.', '该周期内没有这条会话的用量。'];
       }
       await tick();
       if (viewport && request === detailRequest) viewport.scrollTop = offset;
     }
     catch
     {
-      if (request === detailRequest) detailError = local('Could not read the local transcript.', '无法读取本地转录。');
+      if (request === detailRequest) detailError = ['Could not read the local transcript.', '无法读取本地转录。'];
     }
     finally
     {
@@ -504,7 +508,7 @@
     }
     catch
     {
-      error = local('Could not refresh this period.', '无法刷新该周期。');
+      error = ['Could not refresh this period.', '无法刷新该周期。'];
     }
   }
 
@@ -631,7 +635,7 @@
 
   function showListError()
   {
-    error = local('Could not list sessions.', '无法读取会话列表。');
+    error = ['Could not list sessions.', '无法读取会话列表。'];
   }
 
   async function changeList(page: number, tool = route.tool)
@@ -743,7 +747,7 @@
     }
     catch
     {
-      error = local('Could not refresh usage.', '无法刷新用量。');
+      error = ['Could not refresh usage.', '无法刷新用量。'];
     }
   }
 
@@ -774,7 +778,7 @@
       <span class="tab-indicator" aria-hidden="true"></span>
       <button class="tab" aria-pressed={periodSlot === 0} onclick={() => choosePeriod('today')}>DAY</button>
       <button class="tab" aria-pressed={periodSlot === 1} onclick={() => choosePeriod(middlePeriod)}>
-        {middlePeriod === 'month' ? 'MONTH' : statisticsRangeLabels[middlePeriod]}
+        {middlePeriod === 'month' ? 'MONTH' : statisticsRangeTabLabels[middlePeriod]}
       </button>
       <button class="tab" aria-pressed={periodSlot === 2} onclick={() => choosePeriod('allTime')}>TOTAL</button>
     </nav>
@@ -819,7 +823,7 @@
   </section>
 
   {#if error || summary?.failure}
-    <p class="notice error" role="status">{error || (zh ? '扫描失败，点击刷新重试。' : summary?.failure)}</p>
+    <p class="notice error" role="status">{error ? local(...error) : isChinese() ? '扫描失败，点击刷新重试。' : summary?.failure}</p>
   {/if}
   {#if summary?.antigravityPbOnly}
     <p class="notice" role="status">{local('Antigravity .pb-only records are unavailable.', '仅有 .pb 的 Antigravity 记录暂不可读。')}</p>
@@ -831,7 +835,7 @@
         aria-label={route.view === 'home' ? local('Back to Home', '返回主页') : local('Back to Sessions', '返回会话')}>
         <span class="icon" style:--icon={'url(' + icons.back + ')'} aria-hidden="true"></span>
         <span class="ellipsis" title={detail ? sessionTitle(detail.session) : undefined}>
-          {detail ? sessionTitle(detail.session) : route.view === 'home' ? viewLabel.home : viewLabel.sessions}
+          {detail ? sessionTitle(detail.session) : viewLabel(route.view === 'home' ? 'home' : 'sessions')}
         </span>
       </button>
       <button class="sort-button" onclick={() => {
@@ -842,7 +846,7 @@
   {:else if route.view !== 'home' && route.fromHome}
     <div class="detail-head">
       <button class="back-button" bind:this={backButton} onclick={() => chooseView('home')}>
-        <span class="icon" style:--icon={'url(' + icons.back + ')'} aria-hidden="true"></span>{viewLabel.home}
+        <span class="icon" style:--icon={'url(' + icons.back + ')'} aria-hidden="true"></span>{viewLabel('home')}
       </button>
     </div>
   {/if}
@@ -861,7 +865,7 @@
     {/if}
     {#if route.selection}
       {#if loadingDetail && !detail}<p class="notice">{local('Reading transcript…', '正在读取转录…')}</p>{/if}
-      {#if detailError}<p class="notice" role="status">{detailError}</p>{/if}
+      {#if detailError}<p class="notice" role="status">{local(...detailError)}</p>{/if}
       {#if detail}
         {@const session = detail.session}
         {@const provider = toolInfo(session.tool)}
@@ -871,7 +875,9 @@
               title={local('Copy session ID', '复制会话 ID') + ' · ' + (session.nativeId ?? session.id)}>
               <span class="session-id-label">ID</span> {session.nativeId ?? session.id}
             </button>
-            {#if copyResult?.key === sessionKey(session)}<span class="row-meta" role="status">{copyResult.label}</span>{/if}
+            {#if copyResult?.key === sessionKey(session)}
+              <span class="row-meta" role="status">{copyResult.copied ? local('Copied', '已复制') : local('Could not copy ID', '无法复制 ID')}</span>
+            {/if}
           </div>
           <div class="session-head-line">
             <span class="session-detail-model row-meta ellipsis"><span class="icon" style:--icon={'url(' + provider.icon + ')'} aria-hidden="true"></span>
@@ -950,7 +956,7 @@
       {#if !summary.models.length}<p class="notice">{local('No recorded usage in this period.', '该周期暂无可读用量。')}</p>{/if}
     {:else if route.view === 'sessions'}
       {#if !hasSessions}
-        <p class="notice">{local('Sessions are available for DAY, MONTH and TOTAL.', '会话支持 DAY、本月和 TOTAL。')}</p>
+        <p class="notice">{local('Sessions are available for DAY, MONTH and TOTAL.', '会话支持今日、本月和全部。')}</p>
       {:else}
         {#each sessions.rows as row (sessionKey(row))}
           <SessionRow {row} maximum={maxSession} open={openSession} {now} />
@@ -960,7 +966,7 @@
     {:else}
       {#if summary.models.length}
         <section class="home-section">
-          <button class="section-link" onclick={() => chooseView('models', true)}>{viewLabel.models}
+          <button class="section-link" onclick={() => chooseView('models', true)}>{viewLabel('models')}
             <span class="icon" style:--icon={'url(' + icons.models + ')'} aria-hidden="true"></span>
           </button>
           <div class="home-models">
@@ -981,7 +987,7 @@
       <HomeHistory data={activity} failed={activityError} />
       {#if hasSessions && sessions.rows.length}
         <section class="home-section">
-          <button class="section-link" onclick={() => chooseView('sessions', true)}>{viewLabel.sessions}
+          <button class="section-link" onclick={() => chooseView('sessions', true)}>{viewLabel('sessions')}
             <span class="icon" style:--icon={'url(' + icons.sessions + ')'} aria-hidden="true"></span>
           </button>
           {#each sessions.rows.slice(0, 5) as row (sessionKey(row))}
@@ -1022,7 +1028,7 @@
         oncontextmenu={event => { event.preventDefault(); void setViewMenu(true, true); }}
         title={local('Next view', '切换到下一个视图')}>
         <span class="icon" style:--icon={'url(' + icons[route.view] + ')'} aria-hidden="true"></span>
-        {viewLabel[route.view]}
+        {viewLabel(route.view)}
       </button>
       <button class="view-disclosure" bind:this={disclosure} aria-haspopup="menu" aria-controls="view-menu" aria-expanded={viewMenu}
         onpointerenter={event => { if (event.pointerType === 'mouse') void setViewMenu(true); }}
@@ -1037,7 +1043,7 @@
               await chooseView(view);
               disclosure?.focus();
             }}>
-              <span class="icon" style:--icon={'url(' + icons[view] + ')'} aria-hidden="true"></span>{viewLabel[view]}
+              <span class="icon" style:--icon={'url(' + icons[view] + ')'} aria-hidden="true"></span>{viewLabel(view)}
             </button>
           {/each}
         </div>
@@ -1046,7 +1052,7 @@
     {#if !route.selection && route.view === 'tools' && activeTool?.models.length && splits(activeTool.usage.counts).length}
       <div class="tool-modes" role="group" aria-label={local('Tool detail', '工具细分')}>
         <button aria-pressed={route.toolMode === 'tokens'} onclick={() => { route.toolMode = 'tokens'; remember(); }}>{local('Tokens', 'Token')}</button>
-        <button aria-pressed={route.toolMode === 'models'} onclick={() => { route.toolMode = 'models'; remember(); }}>{viewLabel.models}</button>
+        <button aria-pressed={route.toolMode === 'models'} onclick={() => { route.toolMode = 'models'; remember(); }}>{viewLabel('models')}</button>
       </div>
     {/if}
     <button class="icon-button refresh" class:working={summary?.refreshing} disabled={summary?.refreshing || !ready}

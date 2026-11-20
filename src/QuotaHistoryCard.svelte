@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { QuotaHistory, QuotaKey } from './api';
   import { local, time } from './display';
+  import { locale } from './language.svelte';
   import { quotaMoney } from './quota-display';
 
   interface Props
@@ -16,9 +17,9 @@
 
   let { name, label, current, key, resetAt, history, failed }: Props = $props();
   let hoveredDay = $state<string | null>(null);
-  const dayFormat = new Intl.DateTimeFormat(navigator.language, { month: 'numeric', day: 'numeric' });
-  const hourFormat = new Intl.DateTimeFormat(navigator.language, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-  const percent = new Intl.NumberFormat(navigator.language, { style: 'percent', maximumFractionDigits: 1 });
+  const dayFormat = $derived(new Intl.DateTimeFormat(locale(), { month: 'numeric', day: 'numeric' }));
+  const hourFormat = $derived(new Intl.DateTimeFormat(locale(), { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }));
+  const percent = $derived(new Intl.NumberFormat(locale(), { style: 'percent', maximumFractionDigits: 1 }));
   const width = 240;
   const height = 65;
   let min = $derived(key.kind === 'window' ? 0 : Math.min(0, ...(history?.trend.map(point => point.value) ?? [])));

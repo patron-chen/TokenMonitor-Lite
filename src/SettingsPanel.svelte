@@ -1,7 +1,7 @@
 <script lang="ts">
   import { toolIds } from './api';
   import type { Snippet } from 'svelte';
-  import type { Appearance, Backdrop, Cadence, CollectionStatus, Preferences, SettingsSection, StatisticsRange, ToolId } from './api';
+  import type { Appearance, Backdrop, Cadence, CollectionStatus, Language, Preferences, SettingsSection, StatisticsRange, ToolId } from './api';
   import { compact, icons, local, number, statisticsRangeLabels, time, toolInfo } from './display';
 
   interface Props
@@ -22,21 +22,21 @@
   let { appearance = $bindable(), backdrop, preferences, section, collection, busy, errors,
     selectSection, saveAppearance, setPreferences, refreshCollection }: Props = $props();
 
-  const sections: { id: SettingsSection; name: string; icon: string }[] = [
+  const sections: { id: SettingsSection; name: string; icon: string }[] = $derived([
     { id: 'appearance', name: local('Appearance', '外观'), icon: icons.appearance },
     { id: 'collection', name: local('Collection', '采集'), icon: icons.collection },
     { id: 'quotas', name: local('AI Tool Limits', 'AI 工具额度'), icon: icons.limits }
-  ];
-  const sizes: Record<number, string> = {
+  ]);
+  const sizes: Record<number, string> = $derived({
     100: local('Standard', '标准'), 110: local('Larger', '较大'), 120: local('Largest', '最大')
-  };
-  const cadences: Record<Cadence, string> = {
+  });
+  const cadences: Record<Cadence, string> = $derived({
     live: local('Live watch', '实时监看'),
     '5m': local('Every 5 minutes', '每 5 分钟'),
     '15m': local('Every 15 minutes', '每 15 分钟'),
     '30m': local('Every 30 minutes', '每 30 分钟')
-  };
-  const quotaSetup: Record<ToolId, { methods: string[]; instructions: string }> = {
+  });
+  const quotaSetup: Record<ToolId, { methods: string[]; instructions: string }> = $derived({
     codex: {
       methods: [local('Local logs', '本地日志'), 'OAuth'],
       instructions: local('Quota windows come from local Codex logs. Sign in to Codex to enable Banked Reset.',
@@ -52,7 +52,7 @@
       instructions: local('Set DEEPSEEK_API_KEY or DEEPSEEK_KEY and restart the tray app to enable API balance.',
         '设置 DEEPSEEK_API_KEY 或 DEEPSEEK_KEY 后，从托盘退出并重新启动 Lite，即可读取 API 余额。')
     }
-  };
+  });
   let expandedTool = $state<ToolId | null>(null);
   let live = $derived(preferences.collection.cadence === 'live');
   let tracked = $derived(toolIds.filter(tool => preferences.collection.tools[tool]).length);
@@ -145,6 +145,15 @@
           aria-labelledby={'settings-' + tab.id + '-label'} hidden={!open}>
           {#if open && tab.id === 'appearance'}
             <div class="settings-item">
+              <label for="language">{local('Language', '语言')}</label>
+              <select id="language" value={preferences.language} disabled={busy.settings}
+                onchange={event => setPreferences({ ...preferences, language: event.currentTarget.value as Language })}>
+                <option value="system">{local('Follow system', '跟随系统')}</option>
+                <option value="zh-CN" lang="zh-CN">简体中文</option>
+                <option value="en" lang="en">English</option>
+              </select>
+            </div>
+            <div class="settings-item">
               <label for="background-opacity">{local('Background opacity', '背景不透明度')}</label>
               <b>{appearance.opacity}%</b>
               <input class="settings-range" id="background-opacity" type="range" min="65" max="100"
@@ -171,7 +180,7 @@
                 aria-describedby="statistics-range-note" onchange={event => setPreferences({
                   ...preferences, statisticsRange: event.currentTarget.value as StatisticsRange
                 })}>
-                {#each Object.entries(statisticsRangeLabels) as [value, label] (value)}<option {value}>{label}</option>{/each}
+                {#each Object.entries(statisticsRangeLabels()) as [value, label] (value)}<option {value}>{label}</option>{/each}
               </select>
               <p id="statistics-range-note" class="settings-note">
                 {local('Token totals on the middle period tab.', '用于右上角中间页签的 Token 汇总。')}
@@ -262,7 +271,7 @@
               <p class="settings-note">{local('Applies to the Home and Limits views.', '用于主页和额度页的刷新。')}</p>
             </div>
           {/if}
-          {#if open && tab.id !== 'appearance' && errors.settings}
+          {#if open && errors.settings}
             <p class="settings-note error" role="status">{local('Could not save settings.', '无法保存设置。')}</p>
           {/if}
         </div>

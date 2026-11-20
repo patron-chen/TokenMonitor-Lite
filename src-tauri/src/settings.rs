@@ -106,9 +106,41 @@ pub enum StatisticsRange
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Language
+{
+    #[default]
+    System,
+    #[serde(rename = "en")]
+    English,
+    #[serde(rename = "zh-CN")]
+    Chinese,
+}
+
+impl Language
+{
+    pub fn resolve(self) -> Self
+    {
+        if self != Self::System { return self; }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
+            const LANG_CHINESE: u16 = 4;
+            // The low ten bits identify the language across regional variants.
+            if unsafe { GetUserDefaultUILanguage() } & 0x3ff == LANG_CHINESE
+            {
+                return Self::Chinese;
+            }
+        }
+        Self::English
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences
 {
+    pub language: Language,
     pub statistics_range: StatisticsRange,
     pub collection: CollectionSettings,
     pub quotas: QuotaSettings,
@@ -168,12 +200,29 @@ mod tests
     fn existing_settings_default_to_live_collection_and_all_tools()
     {
         let settings: Preferences = serde_json::from_str(r#"{"quotas":{"tools":{"codex":false}}}"#).unwrap();
+        assert_eq!(settings.language, Language::System);
         assert_eq!(settings.statistics_range, StatisticsRange::Last30);
         assert_eq!(settings.collection, CollectionSettings::default());
         assert_eq!(settings.quotas.refresh_minutes, 2);
         assert_eq!(settings.quotas.tools.enabled().collect::<Vec<_>>(), ["antigravity", "dsh"]);
         assert_eq!(settings.collection.tools.scope("today".into()), "today");
         assert_eq!(settings.quotas.tools.scope("today".into()), "today|tools:antigravity,dsh");
+    }
+
+    #[test]
+    fn language_round_trips_with_the_frontend_option_values()
+    {
+        for (language, option) in [
+            (Language::System, "system"), (Language::English, "en"), (Language::Chinese, "zh-CN"),
+        ]
+        {
+            let settings = Preferences { language, ..Preferences::default() };
+            let serialized = serde_json::to_value(settings).unwrap();
+            assert_eq!(serialized["language"], option);
+            assert_eq!(serde_json::from_value::<Preferences>(serialized).unwrap(), settings);
+        }
+        assert_eq!(Language::English.resolve(), Language::English);
+        assert_eq!(Language::Chinese.resolve(), Language::Chinese);
     }
 
     #[test]

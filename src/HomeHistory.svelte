@@ -1,13 +1,14 @@
 <script lang="ts">
   import type { Activity } from './api';
   import { compact, icons, local, number } from './display';
+  import { locale } from './language.svelte';
 
   let { data, failed }: { data: Activity | null; failed: boolean } = $props();
   const weeks = 33;
   const oneDay = 86_400_000;
   const weekColumns = 'repeat(' + weeks + ', minmax(0, 1fr))';
-  const month = new Intl.DateTimeFormat(navigator.language, { month: 'short', timeZone: 'UTC' });
-  const day = new Intl.DateTimeFormat(navigator.language, { month: 'numeric', day: 'numeric', timeZone: 'UTC' });
+  const month = $derived(new Intl.DateTimeFormat(locale(), { month: 'short', timeZone: 'UTC' }));
+  const day = $derived(new Intl.DateTimeFormat(locale(), { month: 'numeric', day: 'numeric', timeZone: 'UTC' }));
 
   const toDay = (value: string) => Date.parse(value + 'T00:00:00Z');
   const dateKey = (at: number) => new Date(at).toISOString().slice(0, 10);

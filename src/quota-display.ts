@@ -1,8 +1,9 @@
 import type { QuotaWindow, QuotaBalance } from './api';
 import { local } from './display';
+import { locale, localized } from './language.svelte';
 
-const minutes = new Intl.NumberFormat(navigator.language, { maximumFractionDigits: 0 });
-const percent = new Intl.NumberFormat(navigator.language, { style: 'percent', maximumFractionDigits: 0 });
+const minutes = localized(locale => new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }));
+const percent = localized(locale => new Intl.NumberFormat(locale, { style: 'percent', maximumFractionDigits: 0 }));
 
 export function quotaGroups(windows: QuotaWindow[])
 {
@@ -21,7 +22,7 @@ export function duration(window: QuotaWindow)
 {
   if (window.minutes === 300) return local('5-hour', '5 小时');
   if (window.minutes === 10080) return local('Weekly', '每周');
-  return window.minutes ? minutes.format(window.minutes) + local(' min', ' 分钟') : '';
+  return window.minutes ? minutes().format(window.minutes) + local(' min', ' 分钟') : '';
 }
 
 export function formatCountdown(total: number)
@@ -41,11 +42,11 @@ export function reset(at: number | null, now: number, compact = false)
   return compact ? countdown : local(`Reset ${countdown}`, `${countdown} 后重置`);
 }
 
-export const remainingPercent = (remaining: number) => percent.format(remaining / 100);
+export const remainingPercent = (remaining: number) => percent().format(remaining / 100);
 
 export function quotaMoney(amount: number, currency: QuotaBalance['currency'])
 {
-  return new Intl.NumberFormat(navigator.language, {
+  return new Intl.NumberFormat(locale(), {
     style: 'currency', currency, currencyDisplay: 'narrowSymbol'
   }).format(amount);
 }

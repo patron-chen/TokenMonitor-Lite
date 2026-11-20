@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { QuotaWindow, ToolQuota } from './api';
-  import { local, time, toolInfo, zh } from './display';
+  import { local, time, toolInfo } from './display';
+  import { isChinese } from './language.svelte';
   import { duration, quotaGroups, quotaMoney, remainingPercent, reset } from './quota-display';
   import QuotaBanked from './QuotaBanked.svelte';
 
@@ -14,6 +15,7 @@
   let { provider, now, openTool }: Props = $props();
   let byModel = $derived(provider.windows.some(window => window.group.trim()));
   let tool = $derived(toolInfo(provider.tool));
+  let zh = $derived(isChinese());
 </script>
 
 {#snippet quotaMetric(window: QuotaWindow, group: string)}

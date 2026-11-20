@@ -11,10 +11,13 @@ export const toolIds = ['codex', 'antigravity', 'dsh'] as const;
 export type ToolId = typeof toolIds[number];
 export type ToolSelection = Record<ToolId, boolean>;
 export type Cadence = 'live' | '5m' | '15m' | '30m';
+export type UiLanguage = 'en' | 'zh-CN';
+export type Language = 'system' | UiLanguage;
 export type SettingsSection = 'appearance' | 'collection' | 'quotas';
 
 export interface Preferences
 {
+  language: Language;
   statisticsRange: StatisticsRange;
   collection: { cadence: Cadence; tools: ToolSelection };
   quotas: { refreshMinutes: number; tools: ToolSelection };
@@ -31,6 +34,7 @@ export interface CollectionStatus
 }
 
 export const defaultPreferences: Preferences = {
+  language: 'system',
   statisticsRange: 'last30',
   collection: { cadence: 'live', tools: { codex: true, antigravity: true, dsh: true } },
   quotas: { refreshMinutes: 2, tools: { codex: true, antigravity: true, dsh: true } }
@@ -218,6 +222,7 @@ export const backend = {
   detailsReady: () => invoke<void>('details_ready'),
   view: () => invoke<{
     view: ViewState | null; backdrop: Backdrop; appearance: Appearance; preferences: Preferences; cachedQuotas: Quotas | null;
+    systemLanguage: UiLanguage;
   }>('get_view_state'),
   remember: (view: ViewState) => invoke<void>('remember_view', { view }),
   appearance: (appearance: Appearance) => invoke<void>('set_appearance', { appearance }),

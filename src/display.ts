@@ -1,4 +1,5 @@
 import type { Counts, RequestPerformance, Session, StatisticsRange, Usage, View } from './api';
+import { local, localized } from './language.svelte';
 import codex from './icons/providers/codex.svg?url';
 import antigravity from './icons/providers/antigravity.svg?url';
 import dsh from './icons/providers/dsh.svg?url';
@@ -17,20 +18,25 @@ import back from './icons/actions/arrow-left.svg?url';
 import spinner from './icons/actions/spinner.svg?url';
 import gemini from './icons/providers/gemini.svg?url';
 
-export const zh = navigator.language.toLowerCase().startsWith('zh');
-export const local = (english: string, chinese: string) => zh ? chinese : english;
-export const statisticsRangeLabels: Record<StatisticsRange, string> = {
-  week: local('WEEK', '本周'), last7: '7D', last30: '30D'
+export { local };
+export const statisticsRangeTabLabels: Record<StatisticsRange, string> = {
+  week: 'WEEK', last7: '7D', last30: '30D'
 };
+export const statisticsRangeLabels = (): Record<StatisticsRange, string> => ({
+  week: local(statisticsRangeTabLabels.week, '本周'),
+  last7: local(statisticsRangeTabLabels.last7, '7 天'),
+  last30: local(statisticsRangeTabLabels.last30, '30 天')
+});
 export const icons = { home, tools, models, sessions, limits, trends, refresh, settings, appearance, collection, search, back, spinner };
 export const views: View[] = ['home', 'limits', 'tools', 'models', 'sessions'];
-export const viewLabel: Record<View, string> = {
-  home: local('Home', '主页'),
-  limits: local('Limits', '额度'),
-  tools: local('Tools', '工具'),
-  models: local('Models', '模型'),
-  sessions: local('Sessions', '会话')
+const viewLabels: Record<View, [string, string]> = {
+  home: ['Home', '主页'],
+  limits: ['Limits', '额度'],
+  tools: ['Tools', '工具'],
+  models: ['Models', '模型'],
+  sessions: ['Sessions', '会话']
 };
+export const viewLabel = (view: View) => local(...viewLabels[view]);
 
 const clients: Record<string, { name: string; icon: string; color: string }> = {
   codex: { name: 'Codex', icon: codex, color: '#54b8c5' },
@@ -40,19 +46,21 @@ const clients: Record<string, { name: string; icon: string; color: string }> = {
 
 export const toolInfo = (key: string) => clients[key] ?? { name: key, icon: '', color: '#b7ead4' };
 export const modelIcon = (model: string, tool: string) => /^gemini[- ]/i.test(model) ? gemini : toolInfo(tool).icon;
-export const number = new Intl.NumberFormat(navigator.language).format;
+const formatters = localized(locale => ({
+  number: new Intl.NumberFormat(locale),
+  date: new Intl.DateTimeFormat(locale, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
+  clock: new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
+  calendar: new Intl.DateTimeFormat(locale, { month: 'numeric', day: 'numeric' }),
+  relative: new Intl.RelativeTimeFormat(locale, { numeric: 'always' })
+}));
+export const number = (value: number) => formatters().number.format(value);
 export const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format;
-const date = new Intl.DateTimeFormat(navigator.language, {
-  month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
-});
-export const time = (at: number | null) => at ? date.format(at) : '';
-const clock = new Intl.DateTimeFormat(navigator.language, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-const calendar = new Intl.DateTimeFormat(navigator.language, { month: 'numeric', day: 'numeric' });
-const relative = new Intl.RelativeTimeFormat(navigator.language, { numeric: 'always' });
+export const time = (at: number | null) => at ? formatters().date.format(at) : '';
 
 export function shortSessionTime(at: number | null, now: number): string
 {
   if (at == null) return '';
+  const { calendar, clock } = formatters();
   return new Date(at).toDateString() === new Date(now).toDateString()
     ? clock.format(at) : calendar.format(at) + ' ' + clock.format(at);
 }
@@ -62,6 +70,7 @@ export function relativeTime(at: number | null, now: number): string
   if (!at) return '';
   const minutes = Math.round(Math.max(0, now - at) / 60_000);
   if (!minutes) return local('just now', '刚刚');
+  const { relative } = formatters();
   if (minutes < 60) return local(relative.format(-minutes, 'minute'), `${number(minutes)} 分钟前`);
   const hours = Math.round(minutes / 60);
   if (hours < 24) return local(relative.format(-hours, 'hour'), `${number(hours)} 小时前`);
@@ -81,19 +90,19 @@ export function cost(usage: Usage, precise = false): string
   return usage.missingPrice ? formatted + local(' priced subtotal', ' 已计价小计') : formatted;
 }
 
-const splitLabels: Record<keyof Counts, string> = {
-  input: local('Input (cache miss)', '输入（未命中）'),
-  output: local('Output', '输出'),
-  cacheRead: local('Cache read', '缓存读取'),
-  cacheWrite: local('Cache write', '缓存写入'),
-  reasoning: local('Reasoning', '推理')
+const splitLabels: Record<keyof Counts, [string, string]> = {
+  input: ['Input (cache miss)', '输入（未命中）'],
+  output: ['Output', '输出'],
+  cacheRead: ['Cache read', '缓存读取'],
+  cacheWrite: ['Cache write', '缓存写入'],
+  reasoning: ['Reasoning', '推理']
 };
 
 export function splits(counts: Counts, format = number)
 {
   return (Object.keys(splitLabels) as (keyof Counts)[])
     .filter(key => counts[key] != null)
-    .map(key => ({ key, label: splitLabels[key], value: format(counts[key] ?? 0) }));
+    .map(key => ({ key, label: local(...splitLabels[key]), value: format(counts[key] ?? 0) }));
 }
 
 export function sessionTitle(session: Session): string
@@ -132,7 +141,7 @@ export function usageSplits(counts: Counts)
   return [
     { key: 'hit', label: local('Input (Cache Hit)', '输入（缓存命中）'), value: number(hit), share: share(hit) },
     { key: 'miss', label: local('Input (Cache Miss)', '输入（缓存未命中）'), value: number(miss), share: share(miss) },
-    { key: 'output', label: splitLabels.output, value: number(output), share: null }
+    { key: 'output', label: local(...splitLabels.output), value: number(output), share: null }
   ];
 }
 

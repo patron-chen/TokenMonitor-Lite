@@ -29,7 +29,7 @@ use model::{Activity, Period, SessionPage, Summary};
 use popover::Popover;
 use quota::{QuotaCache, Quotas};
 use quota_history::{HistoryPreview, QuotaKey};
-use settings::{Preferences, PreferencesStore};
+use settings::{Language, Preferences, PreferencesStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -45,7 +45,7 @@ struct WindowMemory
 {
     view: Mutex<Value>,
     size: Mutex<Option<LogicalSize<f64>>>,
-    backdrop: Mutex<backdrop::Backdrop>,
+    backdrop: Mutex<Option<backdrop::Backdrop>>,
     appearance: Mutex<Appearance>,
     popover: Mutex<Popover>,
 }
@@ -92,7 +92,8 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
     let placement = placement::for_tray(app, icon, preferred);
     let size = placement.as_ref().map_or(preferred, |target| target.logical_size);
     let window = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("index.html".into()))
-        .title("Token Monitor Lite")
+        // DWM can paint the native title behind the transparent WebView2 header.
+        .title("")
         .inner_size(size.width, size.height)
         .min_inner_size(330.0_f64.min(size.width), 370.0_f64.min(size.height))
         .decorations(false)
@@ -116,7 +117,8 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
         window.set_size(target.size)?;
         window.set_position(target.position)?;
     }
-    *memory.backdrop.lock().expect("window material") = backdrop::apply(&window);
+    let material = backdrop::apply(&window);
+    *memory.backdrop.lock().expect("window material") = Some(material);
     Ok(())
 }
 
@@ -139,7 +141,10 @@ fn open(app: &AppHandle, anchor: Option<Rect>)
         eprintln!("Unable to open details: {error}");
         if let Some(tray) = app.tray_by_id("usage")
         {
-            let _ = tray.set_tooltip(Some("Token Monitor Lite · Could not open WebView2"));
+            let language = app.state::<Arc<PreferencesStore>>().get().language.resolve();
+            let message = if language == Language::Chinese { "Token Monitor Lite · 无法打开 WebView2" }
+                else { "Token Monitor Lite · Could not open WebView2" };
+            let _ = tray.set_tooltip(Some(message));
         }
     }
 }
@@ -180,22 +185,34 @@ fn get_view_state(
     let preferences = store.get();
     json!({
         "view": memory.view.lock().expect("view state").clone(),
-        "backdrop": *memory.backdrop.lock().expect("window material"),
+        "backdrop": memory.backdrop.lock().expect("window material").unwrap_or_default(),
         "appearance": *memory.appearance.lock().expect("appearance"),
         "preferences": preferences,
+        "systemLanguage": Language::System.resolve(),
         "cachedQuotas": quotas.cached(preferences.quotas.tools),
     })
 }
 
 #[tauri::command]
 fn set_preferences(
-    store: State<'_, Arc<PreferencesStore>>, engine: State<'_, Arc<Engine>>, preferences: Preferences, period: Period,
+    app: AppHandle, store: State<'_, Arc<PreferencesStore>>, engine: State<'_, Arc<Engine>>,
+    preferences: Preferences, period: Period,
 ) -> Result<(), String>
 {
     let previous = store.save(preferences)?;
     if previous.collection != preferences.collection
     {
         engine.collection_changed(period, previous.collection.tools != preferences.collection.tools);
+    }
+    if previous.language != preferences.language
+    {
+        if let Some(tray) = app.tray_by_id("usage")
+        {
+            let chinese = preferences.language.resolve() == Language::Chinese;
+            if let Ok(menu) = tray_menu(&app, chinese) { let _ = tray.set_menu(Some(menu)); }
+            let summary = engine.summary(Period::Today).unwrap_or_default();
+            let _ = tray.set_tooltip(Some(tooltip(&summary, chinese)));
+        }
     }
     Ok(())
 }
@@ -332,15 +349,12 @@ fn scanner_path() -> std::io::Result<PathBuf>
         .join("../vendor/tokscale.exe"))
 }
 
-fn using_chinese() -> bool
+fn tray_menu(app: &AppHandle, chinese: bool) -> tauri::Result<Menu<tauri::Wry>>
 {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
-        unsafe { GetUserDefaultUILanguage() & 0x3ff == 4 }
-    }
-    #[cfg(not(windows))]
-    false
+    let show = MenuItem::with_id(app, "open", if chinese { "打开" } else { "Open" }, true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "refresh", if chinese { "刷新" } else { "Refresh" }, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", if chinese { "退出" } else { "Exit" }, true, None::<&str>)?;
+    Menu::with_items(app, &[&show, &update, &quit])
 }
 
 fn compact_tokens(tokens: u64) -> String
@@ -408,12 +422,20 @@ fn main()
                     let _ = close_details(app);
                 }
                 #[cfg(windows)]
-                WindowEvent::Destroyed => backdrop::release(),
+                WindowEvent::Destroyed =>
+                {
+                    *memory.backdrop.lock().expect("window material") = None;
+                    backdrop::release();
+                }
                 #[cfg(windows)]
                 WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } =>
                 {
                     let material = *memory.backdrop.lock().expect("window material");
-                    if material == backdrop::Backdrop::Accent { backdrop::resize(window); }
+                    // Size events can arrive before the new HWND has selected its corner treatment.
+                    if let Some(backdrop::Backdrop::Accent | backdrop::Backdrop::None) = material
+                    {
+                        backdrop::resize(window);
+                    }
                 }
                 WindowEvent::Focused(true) =>
                 {
@@ -429,11 +451,11 @@ fn main()
             }
         })
         .setup(|app| {
-            let zh = using_chinese();
-            let show = MenuItem::with_id(app, "open", if zh { "打开" } else { "Open" }, true, None::<&str>)?;
-            let update = MenuItem::with_id(app, "refresh", if zh { "刷新" } else { "Refresh" }, true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", if zh { "退出" } else { "Exit" }, true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &update, &quit])?;
+            let root = app_data_root();
+            let preferences = Arc::new(PreferencesStore::load(&root));
+            app.manage(preferences.clone());
+            let chinese = preferences.get().language.resolve() == Language::Chinese;
+            let menu = tray_menu(app.handle(), chinese)?;
             TrayIconBuilder::with_id("usage")
                 .icon(app.default_window_icon().expect("application icon").clone())
                 .tooltip("Token Monitor Lite")
@@ -473,14 +495,13 @@ fn main()
                 })
                 .build(app)?;
             let handle = app.handle().clone();
-            let root = app_data_root();
-            let preferences = Arc::new(PreferencesStore::load(&root));
-            let engine = Engine::start(&root, scanner_path()?, preferences.clone(), move |period, revision, today| {
+            let engine = Engine::start(&root, scanner_path()?, preferences, move |period, revision, today| {
                 let callback_handle = handle.clone();
                 let _ = handle.run_on_main_thread(move || {
                     if let (Some(summary), Some(tray)) = (today, callback_handle.tray_by_id("usage"))
                     {
-                        let _ = tray.set_tooltip(Some(tooltip(&summary, zh)));
+                        let language = callback_handle.state::<Arc<PreferencesStore>>().get().language;
+                        let _ = tray.set_tooltip(Some(tooltip(&summary, language.resolve() == Language::Chinese)));
                     }
                     if callback_handle.get_webview_window(WINDOW).is_some()
                     {
@@ -488,7 +509,6 @@ fn main()
                     }
                 });
             })?;
-            app.manage(preferences);
             app.manage(Arc::new(engine));
             app.manage(Arc::new(QuotaCache::new(&root)));
             let saved = fs::read(app_data_root().join("appearance.json")).unwrap_or_default();
