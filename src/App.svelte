@@ -95,6 +95,29 @@
   });
 
   $effect(() => {
+    if (!ready) return;
+    // Give the restored panel a frame before showing the transparent host.
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(reveal);
+    });
+    // WebView2 can throttle frame callbacks while its host is hidden.
+    const fallback = setTimeout(reveal, 120);
+    return cancelReveal;
+
+    function cancelReveal()
+    {
+      cancelAnimationFrame(frame);
+      clearTimeout(fallback);
+    }
+
+    function reveal()
+    {
+      cancelReveal();
+      void backend.detailsReady().catch(() => {});
+    }
+  });
+
+  $effect(() => {
     if (!ready || !quotaVisible || quotaLoading || !toolIds.some(tool => preferences.quotas.tools[tool])) return;
     const interval = preferences.quotas.refreshMinutes * 60_000;
     const elapsed = lastQuotaCheck ? Math.max(0, Date.now() - lastQuotaCheck) : 0;

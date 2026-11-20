@@ -215,6 +215,7 @@ export const pageSize = 100;
 export const emptySessions: SessionPage = { rows: [], total: 0, tools: [] };
 
 export const backend = {
+  detailsReady: () => invoke<void>('details_ready'),
   view: () => invoke<{
     view: ViewState | null; backdrop: Backdrop; appearance: Appearance; preferences: Preferences; cachedQuotas: Quotas | null;
   }>('get_view_state'),

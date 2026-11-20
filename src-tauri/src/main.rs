@@ -82,7 +82,8 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
 {
     if let Some(window) = app.get_webview_window(WINDOW)
     {
-        return window.set_focus();
+        if window.is_visible()? { window.set_focus()?; }
+        return Ok(());
     }
     let memory = app.state::<WindowMemory>();
     memory.popover.lock().expect("popover").opening();
@@ -101,6 +102,7 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
         .transparent(true)
         .background_color(tauri::window::Color(0, 0, 0, 0))
         .visible(false)
+        .focused(false)
         .data_directory(app_data_root().join("WebView2"))
         .on_navigation(|url| {
             url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost") ||
@@ -115,8 +117,19 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
         window.set_position(target.position)?;
     }
     *memory.backdrop.lock().expect("window material") = backdrop::apply(&window);
-    window.show()?;
-    window.set_focus()
+    Ok(())
+}
+
+#[tauri::command]
+fn details_ready(window: WebviewWindow) -> tauri::Result<()>
+{
+    // The transparent host stays hidden while WebView2 loads the panel.
+    if !window.is_visible()?
+    {
+        window.show()?;
+        window.set_focus()?;
+    }
+    Ok(())
 }
 
 fn open(app: &AppHandle, anchor: Option<Rect>)
@@ -372,7 +385,7 @@ fn main()
         .manage(WindowMemory::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| open(app, None)))
         .invoke_handler(tauri::generate_handler![
-            dismiss_window, get_view_state, remember_view, set_appearance, set_preferences, get_collection_status,
+            details_ready, dismiss_window, get_view_state, remember_view, set_appearance, set_preferences, get_collection_status,
             get_summary, get_activity, get_quotas, get_quota_history,
             list_sessions, get_session_detail, refresh
         ])
@@ -438,13 +451,13 @@ fn main()
                     {
                         let app = tray.app_handle();
                         let memory = app.state::<WindowMemory>();
-                        let visible = app.get_webview_window(WINDOW).is_some();
+                        let open_or_loading = app.get_webview_window(WINDOW).is_some();
                         if button_state == MouseButtonState::Down
                         {
-                            memory.popover.lock().expect("popover").tray_down(visible, position, Instant::now());
+                            memory.popover.lock().expect("popover").tray_down(open_or_loading, position, Instant::now());
                             return;
                         }
-                        let closes = memory.popover.lock().expect("popover").tray_up(visible, position, Instant::now());
+                        let closes = memory.popover.lock().expect("popover").tray_up(open_or_loading, position, Instant::now());
                         if closes
                         {
                             let _ = close_details(app);
