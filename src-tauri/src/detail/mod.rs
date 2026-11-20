@@ -90,12 +90,53 @@ struct Conversation
     active: Option<usize>,
     next_prompt: Option<(String, Option<i64>)>,
     native_id: Option<String>,
+    metering: Option<MeteredFile>,
+}
+
+pub(crate) struct MeteredRequest
+{
+    pub at: i64,
+    pub model: Option<String>,
+    pub id: Option<String>,
+    pub counts: TokenCounts,
+}
+
+#[derive(Default)]
+pub(crate) struct MeteredFile
+{
+    pub requests: Vec<MeteredRequest>,
+    pub partial: bool,
+    pub custom_provider: bool,
+    since: i64,
+}
+
+/// Use the same de-duplicated turns as session detail, retaining only metering fields.
+pub(crate) fn read_metered(
+    tool: &str, path: &Path, since: i64, observe_quota: impl FnMut(&Value),
+) -> io::Result<MeteredFile>
+{
+    let span = Span { zone: chrono_tz::UTC, start: None, end: None };
+    let mut conversation = Conversation {
+        metering: Some(MeteredFile { since, ..MeteredFile::default() }), ..Conversation::default()
+    };
+    let partial = if tool == "codex"
+    {
+        codex::read_observing(path, &span, &mut conversation, observe_quota)?
+    }
+    else
+    {
+        antigravity::read(&[path.to_owned()], &[], &span, &mut conversation)?
+    };
+    let mut file = conversation.metering.unwrap();
+    file.partial |= partial;
+    Ok(file)
 }
 
 impl Conversation
 {
     fn prompt(&mut self, text: String, at: Option<i64>)
     {
+        if self.metering.is_some() { return; }
         self.active = None;
         self.next_prompt = Some((text, at));
     }
@@ -103,6 +144,15 @@ impl Conversation
     fn add(&mut self, span: &Span, turn: Turn, standalone: bool)
     {
         if !span.contains(turn.at) || turn.tokens == 0 { return; }
+        if let Some(meter) = &mut self.metering
+        {
+            let Some(at) = turn.at else { meter.partial = true; return };
+            if at >= meter.since
+            {
+                meter.requests.push(MeteredRequest { at, model: turn.model, id: turn.response_id, counts: turn.counts });
+            }
+            return;
+        }
         if standalone
         {
             let mut group = self.empty_exchange(None);
@@ -178,7 +228,14 @@ pub fn read(sources: &Sources, mut session: Session, span: &Span, sort: Sort, pa
     Detail { session, exchanges, status, total, observed_tokens }
 }
 
-fn records(path: &Path, tolerate_end: bool, mut record: impl FnMut(Value) -> bool) -> io::Result<bool>
+fn records(path: &Path, tolerate_end: bool, record: impl FnMut(Value) -> bool) -> io::Result<bool>
+{
+    records_matching(path, tolerate_end, |_| true, record)
+}
+
+fn records_matching(
+    path: &Path, tolerate_end: bool, keep: impl Fn(&[u8]) -> bool, mut record: impl FnMut(Value) -> bool,
+) -> io::Result<bool>
 {
     let mut source = BufReader::new(File::open(path)?);
     let compressed = source.fill_buf()?.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
@@ -186,15 +243,17 @@ fn records(path: &Path, tolerate_end: bool, mut record: impl FnMut(Value) -> boo
     {
         let mut decoder = zstd::stream::read::Decoder::with_buffer(source)?;
         decoder.window_log_max(26)?;
-        read_lines(BufReader::new(decoder), tolerate_end, &mut record)
+        read_lines(BufReader::new(decoder), tolerate_end, keep, &mut record)
     }
     else
     {
-        read_lines(source, false, &mut record)
+        read_lines(source, false, keep, &mut record)
     }
 }
 
-fn read_lines(mut input: impl BufRead, tolerate_end: bool, mut record: impl FnMut(Value) -> bool) -> io::Result<bool>
+fn read_lines(
+    mut input: impl BufRead, tolerate_end: bool, keep: impl Fn(&[u8]) -> bool, mut record: impl FnMut(Value) -> bool,
+) -> io::Result<bool>
 {
     let mut line = Vec::new();
     loop
@@ -203,6 +262,12 @@ fn read_lines(mut input: impl BufRead, tolerate_end: bool, mut record: impl FnMu
         match (&mut input).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut line)
         {
             Ok(0) => return Ok(false),
+            Ok(_) if !keep(&line) =>
+            {
+                if line.last() != Some(&b'\n') { input.skip_until(b'\n')?; }
+                if line.capacity() > 1024 * 1024 { line = Vec::new(); }
+                continue;
+            }
             Ok(_) if line.len() > MAX_LINE => return Err(io::Error::new(io::ErrorKind::InvalidData, "Transcript record too large")),
             Ok(_) => {}
             Err(error) if tolerate_end && (error.kind() == io::ErrorKind::UnexpectedEof || error.to_string().contains("incomplete frame")) => return Ok(true),

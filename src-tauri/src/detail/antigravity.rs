@@ -48,7 +48,8 @@ fn read_database(
     db.busy_timeout(Duration::from_millis(500))?;
     // The steps and the generations must come from the same committed WAL view.
     let tx = db.transaction()?;
-    let steps = load_steps(&tx)?;
+    let metering = conversation.metering.is_some();
+    let steps = load_steps(&tx, metering)?;
     let fallback = tx.query_row(
         "SELECT data FROM trajectory_metadata_blob LIMIT 1", [], |row| row.get::<_, Vec<u8>>(0),
     ).optional().ok().flatten().and_then(|data| bytes(&data, 2).and_then(timestamp))
@@ -75,7 +76,8 @@ fn read_database(
         // Recent IDE records put the generation clock on the linked planner step.
         let recorded_at = bytes(chat, 9).and_then(|time| bytes(time, 4)).and_then(timestamp)
             .or_else(|| step.and_then(|step| step.time));
-        let at = recorded_at.or(fallback);
+        // A database modification time cannot place an individual request in a quota window.
+        let at = if metering { recorded_at } else { recorded_at.or(fallback) };
         if let Some((id, (prompt_at, prompt))) = step_id.and_then(|id| steps.prompts.range(..id).next_back())
         {
             if last_prompt != Some(*id)
@@ -91,6 +93,10 @@ fn read_database(
         let timing = recorded_at.and_then(|_| generation_timing(chat));
         let mut turn = Turn::new(at, model, tools, counts, "reply").with_timing(timing);
         turn.response_id = response.map(str::to_owned);
+        if metering && turn.response_id.is_none()
+        {
+            turn.response_id = Some(format!("gen:{}:{index}", path.file_stem().unwrap_or_default().to_string_lossy()));
+        }
         conversation.add(span, turn, step_id.is_none() || last_prompt.is_none());
     }
     Ok(())
@@ -120,14 +126,15 @@ fn generation_timing(chat: &[u8]) -> Option<super::TranscriptTiming>
     super::TranscriptTiming::from_elapsed(elapsed, Some(first / 1_000_000))
 }
 
-fn load_steps(db: &Connection) -> rusqlite::Result<Steps>
+fn load_steps(db: &Connection, metering: bool) -> rusqlite::Result<Steps>
 {
     let mut steps = Steps::default();
     let mut columns = db.prepare("PRAGMA table_info(steps)")?;
     let names = columns.query_map([], |row| row.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
     if names.is_empty() { return Ok(steps); }
     let payload = if names.iter().any(|col| col == "step_payload") { "step_payload" } else { "NULL" };
-    let mut select = db.prepare(&format!("SELECT idx, step_type, metadata, {payload} FROM steps WHERE step_type IN (14, 15)"))?;
+    let kinds = if metering { "(15)" } else { "(14, 15)" };
+    let mut select = db.prepare(&format!("SELECT idx, step_type, metadata, {payload} FROM steps WHERE step_type IN {kinds}"))?;
     let mut rows = select.query([])?;
     while let Some(row) = rows.next()?
     {
@@ -155,7 +162,7 @@ fn load_steps(db: &Connection) -> rusqlite::Result<Steps>
                 steps.generation_index.insert(generation, index);
             }
             let mut tools = Vec::new();
-            if let Some(planner) = payload.as_deref().and_then(|blob| bytes(blob, 20))
+            if let Some(planner) = payload.as_deref().filter(|_| !metering).and_then(|blob| bytes(blob, 20))
             {
                 let mut reader = planner;
                 while let Some((tag, field)) = read_field(&mut reader)
@@ -345,6 +352,14 @@ mod tests
         assert_eq!(modern.at, Some((timestamp as i64 + 5) * 1000));
         assert_eq!(modern.counts.output, Some(220));
         assert_eq!(modern.timing, super::super::TranscriptTiming::from_elapsed(3000, Some(1250)));
+        // Estimate only timestamped generations, even when an undated row has billable usage.
+        writer.execute("INSERT INTO gen_metadata VALUES (2,?1)", [b(1, &b(4, &usage))]).unwrap();
+        let metered = super::super::read_metered("antigravity", &path, 0, |_| {}).unwrap();
+        assert!(metered.partial);
+        assert_eq!(metered.requests.len(), 2);
+        assert_eq!(metered.requests[0].counts.total(), 41);
+        assert_eq!(metered.requests[0].model.as_deref(), Some("gemini-3.5-flash-high"));
+        assert_eq!(metered.requests[1].at, (timestamp as i64 + 5) * 1000);
         drop(writer);
         let _ = fs::remove_file(path);
     }

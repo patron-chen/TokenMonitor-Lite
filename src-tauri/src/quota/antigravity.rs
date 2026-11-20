@@ -67,18 +67,24 @@ fn probe(
                     Rpc::ModelConfigs => (&Value::Null, &data["clientModelConfigs"]),
                 };
                 let Some(mut quota) = antigravity_quota(summary, configs, Utc::now().timestamp_millis()) else { continue };
-                quota.plan = match rpc
+                let identity = match rpc
                 {
                     // Identity is optional. An empty or failed status must preserve a valid summary.
                     Rpc::Summary =>
                     {
                         let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
                         if timeout < Duration::from_millis(1) { None }
-                        else { request(endpoint, Rpc::UserStatus, timeout).as_ref().and_then(plan) }
+                        else { request(endpoint, Rpc::UserStatus, timeout) }
                     }
-                    Rpc::UserStatus => plan(&data),
+                    Rpc::UserStatus => Some(data),
                     Rpc::ModelConfigs => None,
                 };
+                if let Some(status) = identity
+                {
+                    quota.plan = plan(&status);
+                    let user = &status["userStatus"];
+                    quota.account = super::account_tag(user["userId"].as_str().or_else(|| user["email"].as_str()));
+                }
                 return Some(quota);
             }
         }

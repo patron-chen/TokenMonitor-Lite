@@ -132,6 +132,13 @@
   onMount(() => {
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
+    let unsubscribeForecast: (() => void) | undefined;
+    backend.forecastUpdated(snapshot => {
+      if (ready && quotaVisible) applyQuotas(snapshot);
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else unsubscribeForecast = unlisten;
+    }).catch(() => {});
     backend.updated(period => {
       if (ready && period === 'today' && settingsOpen && settingsSection === 'collection') void loadCollection();
       if (ready && period === route.period) void refreshScreen(true);
@@ -147,6 +154,7 @@
     return () => {
       disposed = true;
       unsubscribe?.();
+      unsubscribeForecast?.();
       clearInterval(displayClock);
       [rememberTimer, searchTimer, hoverTimer, holdTimer].forEach(clearTimeout);
     };
@@ -254,9 +262,7 @@
     {
       const data = await backend.quotas(force);
       if (request !== quotaRequest) return;
-      quotas = data;
-      now = Date.now();
-      lastQuotaCheck = data.checkedAt ?? now;
+      applyQuotas(data);
     }
     catch
     {
@@ -272,6 +278,15 @@
         void recordBankedResetPanel(request, readFailed);
       }
     }
+  }
+
+  function applyQuotas(data: Quotas)
+  {
+    // A foreground request can finish delivering after the tray has published newer usage.
+    if (quotas && Math.max(data.observedAt, data.checkedAt ?? 0) < Math.max(quotas.observedAt, quotas.checkedAt ?? 0)) return;
+    quotas = data;
+    now = Date.now();
+    lastQuotaCheck = data.checkedAt ?? now;
   }
 
   async function loadCollection()
@@ -961,7 +976,7 @@
     {:else if !summary?.updatedAt}
       {#if !error && !summary?.failure}<p class="notice" role="status">{local('Reading local usage…', '正在读取本地用量…')}</p>{/if}
     {:else if route.view === 'limits'}
-      <QuotaView data={shownQuotas} loading={quotaLoading} {now} focusTool={route.expanded} />
+      <QuotaView data={shownQuotas} loading={quotaLoading} {now} focusTool={route.expanded} tracked={preferences.collection.tools} />
     {:else if route.view === 'tools'}
       <BreakdownRows rows={summary.tools} kind="tool" mode={route.toolMode} expanded={route.expanded} activate={expand} />
       {#if antigravityWithoutUsage}

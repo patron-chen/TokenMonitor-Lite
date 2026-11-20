@@ -249,7 +249,7 @@ mod tests
         encoded.extend_from_slice(&torn[..10]);
         let decoded = zstd::stream::read::Decoder::new(Cursor::new(encoded)).unwrap();
         let mut seen = Vec::new();
-        let partial = super::super::read_lines(BufReader::new(decoded), true, |row| { seen.push(row["seq"].as_i64()); true }).unwrap();
+        let partial = super::super::read_lines(BufReader::new(decoded), true, |_| true, |row| { seen.push(row["seq"].as_i64()); true }).unwrap();
         assert!(partial);
         assert_eq!(seen, [Some(1)]);
     }

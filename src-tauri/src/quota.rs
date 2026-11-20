@@ -2,7 +2,7 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{atomic::AtomicBool, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -19,6 +19,8 @@ use crate::{
 #[cfg(windows)]
 mod antigravity;
 mod banked_log;
+mod forecast;
+pub(crate) mod sampler;
 use banked_log::BankedResetLog;
 
 #[cfg(all(windows, test))]
@@ -48,6 +50,8 @@ struct ToolQuota
 {
     tool: &'static str,
     plan: Option<String>,
+    #[serde(skip)]
+    account: Option<String>,
     observed_at: i64,
     windows: Vec<QuotaWindow>,
     balances: Vec<Balance>,
@@ -62,6 +66,8 @@ struct QuotaWindow
     minutes: Option<u64>,
     remaining: f64,
     resets_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forecast: Option<forecast::Forecast>,
 }
 
 #[derive(Clone, Serialize)]
@@ -86,6 +92,7 @@ pub struct QuotaCache
     refreshed: Mutex<Option<(Instant, ToolSelection)>>,
     history: Option<QuotaHistory>,
     banked_log: BankedResetLog,
+    stopping: AtomicBool,
 }
 
 impl QuotaCache
@@ -124,6 +131,10 @@ impl QuotaCache
                 Providers::default()
             };
             let (codex, history) = codex.map(|reader| reader.join().expect("Codex quota reader")).unwrap_or_default();
+            if tools.codex
+            {
+                if let Some(store) = &self.history { forecast::observe_account(store, sources, Utc::now().timestamp_millis()); }
+            }
             (codex, providers, history)
         }))
     }
@@ -132,6 +143,47 @@ impl QuotaCache
     {
         self.history.as_ref().ok_or("Quota history is unavailable.")?.preview(key)
             .map_err(|_| "Could not read the local quota history.".into())
+    }
+
+    fn sample_local(&self, sources: &Sources, tools: ToolSelection)
+    {
+        let Some(history) = &self.history else { return };
+        let mut updates = Vec::new();
+        // Take the RPC snapshot first so the usage scan covers its observation time.
+        #[cfg(windows)]
+        if tools.antigravity && sources.home_override.is_none()
+        {
+            if let Some(row) = antigravity::read() { updates.push(row); }
+        }
+        let now = Utc::now().timestamp_millis();
+        for tool in tools.enabled()
+        {
+            match forecast::sync(history, sources, tool, now, &self.stopping)
+            {
+                Ok(Some(row)) => updates.push(row),
+                Ok(None) => (),
+                Err(error) => eprintln!("Could not index {tool} quota usage: {error}"),
+            }
+        }
+        // Serialize publication with foreground refreshes, keeping the full refresh TTL independent.
+        let _refresh = self.refreshed.lock().expect("quota refresh");
+        let mut snapshot = self.snapshot.lock().expect("quota snapshot").clone();
+        let mut samples = Vec::new();
+        for mut row in updates
+        {
+            row.samples(&mut samples);
+            if let Some(old) = snapshot.tools.iter_mut().find(|old| old.tool == row.tool)
+            {
+                if !old.windows.is_empty() && old.observed_at >= row.observed_at { continue; }
+                row.banked_reset.clone_from(&old.banked_reset);
+                *old = row;
+            }
+            else { snapshot.tools.push(row); }
+        }
+        if history.record(&samples, now).is_err() { eprintln!("Could not save background quota observations."); }
+        forecast::attach(history, &mut snapshot.tools, tools, now);
+        snapshot.observed_at = snapshot.observed_at.max(Utc::now().timestamp_millis());
+        *self.snapshot.lock().expect("quota snapshot") = snapshot;
     }
 
     pub fn record_banked_reset_panel(&self, limits_view: bool, codex_enabled: bool, read_failed: bool, count: Option<u64>, rendered: bool)
@@ -163,6 +215,7 @@ impl QuotaCache
         if let Some(history) = &self.history
         {
             if history.record(&samples, observed_at).is_err() { eprintln!("Could not save the local quota history."); }
+            forecast::attach(history, &mut snapshot.tools, settings.tools, observed_at);
         }
         *refreshed = Some((Instant::now(), settings.tools));
         let result = snapshot.for_tools(settings.tools);
@@ -204,8 +257,13 @@ impl Quotas
         let previous_bank = previous_codex.as_ref().and_then(|quota| quota.banked_reset.as_ref());
         let bank_source = if bank.is_some() { "response" } else if previous_bank.is_some() { "previous" } else { "none" };
         let bank = bank.or_else(|| previous_bank.cloned());
-        let codex = add_banked_reset(codex.or(previous_codex), bank, now);
-        self.tools = [antigravity.or_else(|| previous("antigravity")), codex,
+        let newest = |fresh: Option<ToolQuota>, prior: Option<ToolQuota>| match (fresh, prior)
+        {
+            (Some(new), Some(old)) if !old.windows.is_empty() && old.observed_at > new.observed_at => Some(old),
+            (new, old) => new.or(old),
+        };
+        let codex = add_banked_reset(newest(codex, previous_codex), bank, now);
+        self.tools = [newest(antigravity, previous("antigravity")), codex,
             deepseek.or_else(|| previous("dsh"))].into_iter().flatten().collect();
         bank_source
     }
@@ -218,10 +276,12 @@ impl ToolQuota
         output.extend(self.windows.iter().map(|window| Sample {
             key: QuotaKey::Window { tool: self.tool.into(), group: window.group.clone(), minutes: window.minutes },
             reading: Reading { at: self.observed_at, value: window.remaining, reset_at: window.resets_at },
+            plan: self.plan.clone(), account: self.account.clone(),
         }));
         output.extend(self.balances.iter().map(|balance| Sample {
             key: QuotaKey::Balance { tool: self.tool.into(), currency: balance.currency.into() },
             reading: Reading { at: self.observed_at, value: balance.amount, reset_at: None },
+            plan: None, account: None,
         }));
     }
 }
@@ -314,12 +374,12 @@ fn parse_codex(value: &Value) -> Option<ToolQuota>
         Some(QuotaWindow {
             group: String::new(), minutes: window["window_minutes"].as_u64(),
             remaining: (100.0 - window["used_percent"].as_f64()?).clamp(0.0, 100.0),
-            resets_at: reset_time(&window["resets_at"]),
+            resets_at: reset_time(&window["resets_at"]), forecast: None,
         })
     }).collect();
     windows.sort_by_key(|window| window.minutes);
     (!windows.is_empty()).then_some(ToolQuota {
-        tool: "codex", plan, observed_at, windows, balances: vec![], banked_reset: None,
+        tool: "codex", plan, account: account_tag(limits["account_id"].as_str()), observed_at, windows, balances: vec![], banked_reset: None,
     })
 }
 
@@ -327,7 +387,7 @@ fn add_banked_reset(codex: Option<ToolQuota>, banked_reset: Option<BankedReset>,
 {
     let Some(banked_reset) = banked_reset else { return codex };
     let mut quota = codex.unwrap_or_else(|| ToolQuota {
-        tool: "codex", plan: None, observed_at: now, windows: vec![], balances: vec![], banked_reset: None,
+        tool: "codex", plan: None, account: None, observed_at: now, windows: vec![], balances: vec![], banked_reset: None,
     });
     quota.banked_reset = Some(banked_reset);
     Some(quota)
@@ -388,6 +448,14 @@ fn window_minutes(bucket: &Value) -> Option<u64>
 
 fn percent(fraction: f64) -> f64 { (fraction * 100.0).clamp(0.0, 100.0) }
 
+fn account_tag(id: Option<&str>) -> Option<String>
+{
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    id.map(str::trim).filter(|id| !id.is_empty())?.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
 fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Option<ToolQuota>
 {
     let summary = [&summary["response"], &summary["summary"], summary].into_iter()
@@ -413,7 +481,7 @@ fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Opti
             if let (Some(fraction), Some(minutes)) = (fraction, window_minutes(bucket))
             {
                 windows.push(QuotaWindow { group: label.to_owned(), minutes: Some(minutes),
-                    remaining: percent(fraction), resets_at: reset_time(&bucket["resetTime"]) });
+                    remaining: percent(fraction), resets_at: reset_time(&bucket["resetTime"]), forecast: None });
             }
         }
     }
@@ -438,7 +506,7 @@ fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Opti
             let quota = &cfg["quotaInfo"];
             let Some(fraction) = quota["remainingFraction"].as_f64() else { continue };
             let value = QuotaWindow { group: group.to_owned(), minutes: None, remaining: percent(fraction),
-                resets_at: reset_time(&quota["resetTime"]) };
+                resets_at: reset_time(&quota["resetTime"]), forecast: None };
             if let Some(existing) = windows.iter_mut().find(|window| window.group == group)
             {
                 if value.remaining < existing.remaining { *existing = value; }
@@ -451,7 +519,7 @@ fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Opti
         (rank, window.minutes)
     });
     (!windows.is_empty()).then_some(ToolQuota {
-        tool: "antigravity", plan: None, observed_at, windows, balances: vec![], banked_reset: None,
+        tool: "antigravity", plan: None, account: None, observed_at, windows, balances: vec![], banked_reset: None,
     })
 }
 
@@ -463,7 +531,7 @@ fn deepseek_quota(data: &Value, observed_at: i64) -> Option<ToolQuota>
         amount.is_finite().then_some(Balance { currency, amount })
     }).collect();
     (!balances.is_empty()).then_some(ToolQuota {
-        tool: "dsh", plan: None, observed_at, windows: vec![], balances, banked_reset: None,
+        tool: "dsh", plan: None, account: None, observed_at, windows: vec![], balances, banked_reset: None,
     })
 }
 

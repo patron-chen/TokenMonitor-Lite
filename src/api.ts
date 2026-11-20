@@ -85,6 +85,19 @@ export interface QuotaWindow
   minutes: number | null;
   remaining: number;
   resetsAt: number | null;
+  forecast?: QuotaForecast;
+}
+
+export interface QuotaForecast
+{
+  basis: 'current' | 'history' | 'insufficient';
+  observedAt: number;
+  usedTokens: number | null;
+  usedUsd: number | null;
+  missingPrice: boolean;
+  partial: boolean;
+  totalTokens: number | null;
+  totalUsd: number | null;
 }
 
 export interface QuotaBalance { currency: 'USD' | 'CNY'; amount: number }
@@ -235,6 +248,8 @@ export const backend = {
   bankedResetPanel: (limitsView: boolean, codexEnabled: boolean, readFailed: boolean, count: number | null, rendered: boolean) =>
     invoke<void>('record_banked_reset_panel', { limitsView, codexEnabled, readFailed, count, rendered }),
   quotaHistory: (key: QuotaKey) => invoke<QuotaHistory>('get_quota_history', { key }),
+  forecastUpdated: (callback: (snapshot: Quotas) => void) =>
+    listen<Quotas>('quota-forecast-updated', event => callback(event.payload)),
   sessions: (period: Period, tool: string | null, query: string, page: number, preview: boolean) =>
     invoke<SessionPage>('list_sessions', { period, tool, query, page, preview }),
   detail: (period: Period, selection: SessionKey, sort: Sort, page: number) =>

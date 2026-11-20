@@ -289,6 +289,18 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .limits-group { margin-top: 9px; }
 .limits-group h3 { margin: 0 0 5px; font-size: 0.625rem; font-weight: 600; }
 .limits-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; }
+.limits-group { container-type: inline-size; }
+.limits-grid:has(.limits-forecast) { display: flex; flex-wrap: wrap; }
+.limits-grid:has(.limits-forecast) > .limits-window { flex: 1 1 calc(50% - 5px); min-width: min-content; }
+@container (max-width: 20.5rem)
+{
+  .limits-grid:has(.limits-forecast) > .limits-window { flex-basis: 100%; }
+}
+.limits-window { min-width: 0; }
+.limits-window > .limits-reading { width: 100%; }
+.limits-forecast { display: flex; align-items: center; gap: 5px; margin-top: 3px; font: 0.5625rem/1.3 var(--mono); color: var(--muted); white-space: nowrap; }
+.forecast-info { anchor-name: none; position: relative; }
+.forecast-info::before { content: ""; position: absolute; inset: -3px; }
 .limits-grid > :only-child { grid-column: 1 / -1; }
 .limits-reading { display: grid; gap: 5px; min-width: 0; padding: 1px 0 2px; border-radius: 4px; text-align: start; }
 .limits-reading:hover, .limits-reading[aria-expanded="true"] { background: #ffffff0c; }
@@ -316,6 +328,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   font-size: 0.625rem;
 }
 .quota-history-title, .quota-history-current, .quota-history-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+.quota-history-card.forecast-tip { width: max-content; max-width: calc(100vw - 16px); padding: 7px 9px; }
+.forecast-tip strong, .forecast-tip small { display: block; }
+.forecast-tip small { margin-top: 2px; color: var(--muted); font-size: 0.5625rem; }
 .quota-history-title strong { font-size: 0.75rem; }
 .quota-history-title time, .quota-history-heading > span, .quota-history-footer { color: var(--muted); }
 .quota-history-title time, .quota-history-current b { flex: none; }

@@ -84,10 +84,14 @@ export function cost(usage: Usage, precise = false): string
   {
     return usage.missingPrice ? local('Price unavailable', '暂无估价') : '—';
   }
-  const amount = usage.costUsd;
-  const digits = amount === 0 || (!precise && amount >= 1) ? 2 : 4;
-  const formatted = amount > 0 && amount < 0.0001 ? '<$0.0001' : '$' + amount.toFixed(digits);
+  const formatted = apiDollars(usage.costUsd, precise);
   return usage.missingPrice ? formatted + local(' priced subtotal', ' 已计价小计') : formatted;
+}
+
+export function apiDollars(amount: number, precise = false): string
+{
+  const digits = amount === 0 || (!precise && amount >= 1) ? 2 : 4;
+  return amount > 0 && amount < 0.0001 ? '<$0.0001' : '$' + amount.toFixed(digits);
 }
 
 const splitLabels: Record<keyof Counts, [string, string]> = {

@@ -1,5 +1,5 @@
 import type { QuotaWindow, QuotaBalance } from './api';
-import { local } from './display';
+import { apiDollars, compact, local } from './display';
 import { locale, localized } from './language.svelte';
 
 const minutes = localized(locale => new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }));
@@ -43,6 +43,17 @@ export function reset(at: number | null, now: number, compact = false)
 }
 
 export const remainingPercent = (remaining: number) => percent().format(remaining / 100);
+
+export function forecastLabel(window: QuotaWindow, tracked: boolean, now: number)
+{
+  if (!tracked) return local('Usage tracking off', '未启用用量采集');
+  if (!window.resetsAt || window.resetsAt <= now) return local('Awaiting update', '等待额度更新');
+  const value = window.forecast;
+  if (!value || value.totalTokens == null) return local('Collecting samples', '样本不足');
+  const prefix = value.basis === 'history' ? local('Hist. ≈', '历史约 ') : local('Est. ', '预计 ');
+  const usd = value.totalUsd == null ? local('unpriced', '缺价') : apiDollars(value.totalUsd);
+  return prefix + compact(value.totalTokens) + ' Token · ' + usd;
+}
 
 export function quotaMoney(amount: number, currency: QuotaBalance['currency'])
 {

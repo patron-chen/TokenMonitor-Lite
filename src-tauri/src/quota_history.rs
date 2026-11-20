@@ -18,6 +18,9 @@ const SCHEMA: &str = "
         PRIMARY KEY(series, at)
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS readings_by_time ON readings(at);
+    CREATE TABLE IF NOT EXISTS quota_profiles (
+        tool TEXT NOT NULL, at INTEGER NOT NULL, plan TEXT, account TEXT, PRIMARY KEY(tool, at)
+    ) WITHOUT ROWID;
 ";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -66,6 +69,8 @@ pub struct Sample
 {
     pub key: QuotaKey,
     pub reading: Reading,
+    pub plan: Option<String>,
+    pub account: Option<String>,
 }
 
 pub struct QuotaHistory
@@ -106,13 +111,18 @@ impl QuotaHistory
 {
     pub fn new(root: &Path) -> Self { Self { file: root.join("quota-history.sqlite") } }
 
+    pub(crate) fn connection(&self) -> rusqlite::Result<Connection>
+    {
+        let db = Connection::open(&self.file)?;
+        db.busy_timeout(Duration::from_secs(2))?;
+        db.execute_batch(SCHEMA)?;
+        Ok(db)
+    }
+
     pub fn record(&self, samples: &[Sample], now: i64) -> rusqlite::Result<()>
     {
         if samples.is_empty() { return Ok(()); }
-        let mut db = Connection::open(&self.file)?;
-        db.busy_timeout(Duration::from_millis(750))?;
-        db.execute_batch(SCHEMA)?;
-        record(&mut db, samples, now)
+        record(&mut self.connection()?, samples, now)
     }
 
     pub fn preview(&self, key: &QuotaKey) -> rusqlite::Result<HistoryPreview>
@@ -129,26 +139,43 @@ impl QuotaHistory
     }
 }
 
-fn record(db: &mut Connection, samples: &[Sample], now: i64) -> rusqlite::Result<()>
+pub(crate) fn store_samples(db: &Connection, samples: &[Sample], now: i64) -> rusqlite::Result<()>
 {
     let cutoff = now - RETENTION_MS;
-    let tx = db.transaction()?;
+    let mut insert = db.prepare_cached("INSERT OR IGNORE INTO readings VALUES (?1, ?2, ?3, ?4)")?;
+    for sample in samples
     {
-        let mut insert = tx.prepare("INSERT OR IGNORE INTO readings VALUES (?1, ?2, ?3, ?4)")?;
-        for sample in samples
+        let reading = sample.reading;
+        if reading.at >= cutoff && reading.at <= now && reading.value.is_finite()
         {
-            let reading = sample.reading;
-            if reading.at >= cutoff && reading.at <= now && reading.value.is_finite()
+            insert.execute(params![sample.key.identity(), reading.at, reading.value, reading.reset_at])?;
+            if sample.plan.is_some() || sample.account.is_some()
             {
-                insert.execute(params![sample.key.identity(), reading.at, reading.value, reading.reset_at])?;
+                store_profile(db, sample.key.tool(), reading.at, sample.plan.as_deref(), sample.account.as_deref())?;
             }
         }
     }
-    tx.execute("DELETE FROM readings WHERE at < ?1", [cutoff])?;
+    Ok(())
+}
+
+pub(crate) fn store_profile(db: &Connection, tool: &str, at: i64, plan: Option<&str>, account: Option<&str>) -> rusqlite::Result<()>
+{
+    db.prepare_cached("INSERT INTO quota_profiles VALUES (?1,?2,?3,?4)
+        ON CONFLICT(tool,at) DO UPDATE SET plan=COALESCE(excluded.plan,plan), account=COALESCE(excluded.account,account)")?
+        .execute(params![tool, at, plan, account])?;
+    Ok(())
+}
+
+fn record(db: &mut Connection, samples: &[Sample], now: i64) -> rusqlite::Result<()>
+{
+    let tx = db.transaction()?;
+    store_samples(&tx, samples, now)?;
+    tx.execute("DELETE FROM readings WHERE at < ?1", [now - RETENTION_MS])?;
+    tx.execute("DELETE FROM quota_profiles WHERE at < ?1", [now - RETENTION_MS])?;
     tx.commit()
 }
 
-fn read(db: &Connection, key: &QuotaKey, now: i64) -> rusqlite::Result<Vec<Reading>>
+pub(crate) fn read(db: &Connection, key: &QuotaKey, now: i64) -> rusqlite::Result<Vec<Reading>>
 {
     let mut query = db.prepare("SELECT at, value, reset_at FROM readings
         WHERE series = ?1 AND at BETWEEN ?2 AND ?3 ORDER BY at")?;
@@ -158,7 +185,7 @@ fn read(db: &Connection, key: &QuotaKey, now: i64) -> rusqlite::Result<Vec<Readi
     result
 }
 
-fn same_reset(left: i64, right: i64) -> bool { left.abs_diff(right) <= RESET_TOLERANCE }
+pub(crate) fn same_reset(left: i64, right: i64) -> bool { left.abs_diff(right) <= RESET_TOLERANCE }
 
 fn consumption(previous: Reading, current: Reading) -> Option<f64>
 {
@@ -266,7 +293,7 @@ mod tests
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
         let now = 2_000_000_000_000;
-        let sample = |group, at, value| Sample { key: window(group), reading: Reading { at, value, reset_at: None } };
+        let sample = |group, at, value| Sample { key: window(group), reading: Reading { at, value, reset_at: None }, plan: None, account: None };
         record(&mut db, &[sample("Gemini", now - 100, 71.0), sample("Argon", now - 100, 61.0)], now).unwrap();
         record(&mut db, &[sample("Gemini", now - 100, 60.0), sample("Gemini", now - 1000, 73.0),
             sample("Gemini", now - RETENTION_MS - 1, 100.0)], now).unwrap();

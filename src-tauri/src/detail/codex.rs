@@ -4,15 +4,42 @@ use serde_json::Value;
 
 use crate::{model::reasoning_effort, sources::codex_index_id};
 
-use super::{add_tool, content_prompt, image_label, number, records, summary, text, time,
+use super::{add_tool, content_prompt, image_label, number, records_matching, summary, text, time,
     Conversation, Span, TokenCounts, TranscriptTiming, Turn};
 
 pub(super) fn read(path: &Path, span: &Span, conversation: &mut Conversation) -> io::Result<bool>
 {
+    read_observing(path, span, conversation, |_| {})
+}
+
+pub(super) fn read_observing(
+    path: &Path, span: &Span, conversation: &mut Conversation, mut observe: impl FnMut(&Value),
+) -> io::Result<bool>
+{
+    let metering = conversation.metering.is_some();
     let mut parser = Parser::new(span, conversation);
-    let result = records(path, false, |value| { parser.record(&value); true });
+    let result = records_matching(path, false, |line| !metering || metering_line(line), |value| {
+        parser.record(&value);
+        if !parser.fork_prefix && value["payload"]["rate_limits"].is_object()
+        {
+            observe(&value);
+        }
+        true
+    });
     parser.flush_pending();
     result
+}
+
+fn metering_line(line: &[u8]) -> bool
+{
+    // Large tool results and assistant output do not affect request counts. Unrecognized
+    // JSON layouts still go through the normal parser.
+    let head = &line[..line.len().min(256)];
+    let marker = br#""type":"response_item","payload":{"type":""#;
+    let Some(offset) = head.windows(marker.len()).position(|part| part == marker) else { return true };
+    let kind = &head[offset + marker.len()..];
+    ![b"function_call".as_slice(), b"custom_tool_call", b"reasoning", br#"message","role":"assistant"#]
+        .iter().any(|prefix| kind.starts_with(prefix))
 }
 
 struct Pending
@@ -120,6 +147,7 @@ struct Parser<'a>
     pending: Option<Pending>,
     response_ids: HashSet<String>,
     previous_prompt: Option<(bool, String)>,
+    other_pool: bool,
 }
 
 impl<'a> Parser<'a>
@@ -129,7 +157,7 @@ impl<'a> Parser<'a>
         Self {
             span, conversation, model: None, effort: None, session: None, fork_prefix: false,
             tools: Vec::new(), latest_total: None, clock: RequestClock::default(), pending: None,
-            response_ids: HashSet::new(), previous_prompt: None,
+            response_ids: HashSet::new(), previous_prompt: None, other_pool: false,
         }
     }
 
@@ -143,6 +171,10 @@ impl<'a> Parser<'a>
             Some("session_meta") =>
             {
                 self.session = text(&payload["id"]).map(str::to_owned);
+                if let Some(meter) = &mut self.conversation.metering
+                {
+                    meter.custom_provider = text(&payload["model_provider"]).is_some_and(|id| !id.eq_ignore_ascii_case("openai"));
+                }
                 if self.conversation.native_id.is_none()
                 {
                     self.conversation.native_id = self.session.as_deref().and_then(codex_index_id).map(str::to_owned);
@@ -235,6 +267,10 @@ impl<'a> Parser<'a>
 
     fn count(&mut self, payload: &Value, at: Option<i64>)
     {
+        if payload["rate_limits"].is_object()
+        {
+            self.other_pool = payload["rate_limits"]["limit_id"].as_str().is_some_and(|id| id != "codex");
+        }
         let info = &payload["info"];
         let last = raw_usage(&info["last_token_usage"]);
         let total = raw_usage(&info["total_token_usage"]);
@@ -301,14 +337,18 @@ impl<'a> Parser<'a>
         turn.reasoning_effort = effort;
         turn.response_id = response_id;
         turn.reasoning_exposed = reasoning_exposed;
-        self.conversation.add(self.span, turn, false);
+        if !self.other_pool || self.conversation.metering.is_none()
+        {
+            self.conversation.add(self.span, turn, false);
+        }
     }
 
     fn flush_pending(&mut self)
     {
         if let Some(pending) = self.pending.take()
         {
-            if pending.turn.response_id.as_ref().is_none_or(|id| self.response_ids.insert(id.clone()))
+            if (!self.other_pool || self.conversation.metering.is_none())
+                && pending.turn.response_id.as_ref().is_none_or(|id| self.response_ids.insert(id.clone()))
             {
                 self.conversation.add(self.span, pending.turn, false);
             }

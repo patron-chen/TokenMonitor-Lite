@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs, io, path::Path};
 
 use serde::Deserialize;
 
-use crate::cache::Entry;
+use crate::{cache::Entry, model::TokenCounts};
 
 const SNAPSHOT: &str = include_str!("../resources/pricing-litellm.json");
 
@@ -45,17 +45,26 @@ impl Pricing
 
     pub fn cost(&self, entry: &Entry) -> (Option<f64>, bool)
     {
-        let counts = entry.counts;
+        let (mut known, missing) = self.request_cost(&entry.provider, &entry.model, entry.counts);
+        // Tokscale can supply request-level tier pricing for a complete report row.
+        if !missing && entry.counts.total() > 0 && entry.cost.is_finite() && entry.cost > 0.0
+        {
+            known = Some(entry.cost);
+        }
+        (known, missing)
+    }
+
+    pub fn request_cost(&self, provider: &str, model: &str, counts: TokenCounts) -> (Option<f64>, bool)
+    {
         if counts.total() == 0
         {
             return (Some(0.0), false);
         }
-        let provider = match entry.provider.as_str()
+        let provider = match provider
         {
             "google" | "google-ai-studio" => "gemini",
             provider => provider,
         };
-        let model = entry.model.as_str();
         let prefixed = format!("{provider}/{model}");
         let price = [prefixed.as_str(), model].into_iter().filter_map(|id| self.data.get(id))
             .find(|price| price.litellm_provider == provider);
@@ -81,12 +90,6 @@ impl Pricing
             {
                 missing = true;
             }
-        }
-        // Preserve Tokscale's request-level tier pricing for complete rows.
-        // A zero from its report can also mean it could not resolve this model.
-        if !missing && entry.cost.is_finite() && entry.cost > 0.0
-        {
-            known = Some(entry.cost);
         }
         (known, missing)
     }

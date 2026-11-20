@@ -30,6 +30,7 @@ use engine::{current_span, CollectionStatus, Engine, Update};
 use model::{Activity, Period, SessionPage, Summary};
 use popover::Popover;
 use quota::{QuotaCache, Quotas};
+use quota::sampler::Sampler;
 use quota_history::{HistoryPreview, QuotaKey};
 use settings::{Language, Preferences, PreferencesStore};
 use serde::{Deserialize, Serialize};
@@ -202,6 +203,10 @@ fn set_preferences(
 ) -> Result<(), String>
 {
     let previous = store.save(preferences)?;
+    if previous.quotas != preferences.quotas || previous.collection.tools != preferences.collection.tools
+    {
+        app.state::<Sampler>().settings_changed();
+    }
     if previous.collection != preferences.collection
     {
         engine.collection_changed(period, previous.collection.tools != preferences.collection.tools);
@@ -468,6 +473,7 @@ fn main()
         })
         .setup(|app| {
             let root = app_data_root();
+            fs::create_dir_all(&root)?;
             let preferences = Arc::new(PreferencesStore::load(&root));
             app.manage(preferences.clone());
             let chinese = preferences.get().language.resolve() == Language::Chinese;
@@ -511,7 +517,23 @@ fn main()
                 })
                 .build(app)?;
             let handle = app.handle().clone();
+            let quotas = Arc::new(QuotaCache::new(&root));
+            let panel = handle.clone();
+            let display_cache = quotas.clone();
+            let display_preferences = preferences.clone();
+            let (sampler, usage_signal) = Sampler::start(quotas.clone(), preferences.clone(), move || {
+                if panel.get_webview_window(WINDOW).is_some()
+                {
+                    if let Some(snapshot) = display_cache.cached(display_preferences.get().quotas.tools)
+                    {
+                        let _ = panel.emit_to(WINDOW, "quota-forecast-updated", snapshot);
+                    }
+                }
+            })?;
+            app.manage(quotas);
+            app.manage(sampler);
             let engine = Engine::start(&root, scanner_path()?, preferences, move |period, revision, today| {
+                if let Some(summary) = &today { usage_signal.updated(summary); }
                 let callback_handle = handle.clone();
                 let _ = handle.run_on_main_thread(move || {
                     if let (Some(summary), Some(tray)) = (today, callback_handle.tray_by_id("usage"))
@@ -526,7 +548,6 @@ fn main()
                 });
             })?;
             app.manage(Arc::new(engine));
-            app.manage(Arc::new(QuotaCache::new(&root)));
             let saved = fs::read(app_data_root().join("appearance.json")).unwrap_or_default();
             *app.state::<WindowMemory>().appearance.lock().expect("appearance") = decode_appearance(&saved);
             if std::env::args_os().any(|arg| arg == "--open")
@@ -541,7 +562,11 @@ fn main()
             match event
             {
                 RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
-                RunEvent::ExitRequested { code: Some(_), .. } => app.state::<Arc<Engine>>().shutdown(),
+                RunEvent::ExitRequested { code: Some(_), .. } =>
+                {
+                    app.state::<Arc<Engine>>().shutdown();
+                    app.state::<Sampler>().shutdown();
+                }
                 _ => {}
             }
         });

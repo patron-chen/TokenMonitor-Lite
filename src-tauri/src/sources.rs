@@ -20,6 +20,11 @@ impl Sources
     pub fn discover() -> Self
     {
         let home_override = env_path("TOKEN_MONITOR_LITE_SOURCE_HOME").filter(|path| path.is_absolute());
+        Self::from_home(home_override)
+    }
+
+    pub(crate) fn from_home(home_override: Option<PathBuf>) -> Self
+    {
         let home = home_override.clone().or_else(|| env_path("HOME").filter(|path| path.is_absolute()))
             .or_else(|| env_path("USERPROFILE")).unwrap_or_else(env::temp_dir);
         let root = |name: &str, fallback: PathBuf| {
