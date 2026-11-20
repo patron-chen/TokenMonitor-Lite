@@ -1,9 +1,67 @@
 use serde_json::json;
 use super::*;
+use crate::quota::powershell_json;
 
 fn endpoint(rank: u8, port: u16) -> Endpoint
 {
     Endpoint { rank, port, secure: true, csrf: String::new() }
+}
+
+#[test]
+fn loopback_rpcs_share_the_http_worker_and_bypass_the_shortcut_proxy()
+{
+    use std::{io::{BufRead, BufReader, Read, Write}, net::{TcpListener, TcpStream}, thread};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut calls = Vec::new();
+        for client in listener.incoming()
+        {
+            let mut client = client.unwrap();
+            let mut reader = BufReader::new(&client);
+            let mut first = String::new();
+            if reader.read_line(&mut first).unwrap() == 0 { break; }
+            let mut size = 0;
+            let mut authenticated = false;
+            for line in reader.by_ref().lines().map(Result::unwrap).take_while(|line| !line.is_empty())
+            {
+                let (name, value) = line.split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("Content-Length") { size = value.trim().parse().unwrap(); }
+                if name.eq_ignore_ascii_case("X-Codeium-Csrf-Token") { authenticated = value.trim() == "local-fixture"; }
+            }
+            if !first.starts_with("POST ")
+            {
+                // The RPC endpoint only accepts POST. Any other host-side probe must carry no service token.
+                assert!(!authenticated);
+                client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                continue;
+            }
+            let mut body = vec![0; size];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            calls.push((first, authenticated, body));
+            client.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").unwrap();
+        }
+        calls
+    });
+    let ep = Endpoint { rank: 0, port: address.port(), secure: false, csrf: "local-fixture".into() };
+    let script = concat!("$env:TOKEN_MONITOR_LITE_PROXY_SERVER = 'http://127.0.0.1:1'\n",
+        include_str!("../../../../scripts/windows-http.ps1"), "\nRead-LiteHttpRequests");
+    let result = with_http_worker(script, Instant::now() + Duration::from_secs(8), |worker| {
+        let summary = request(worker, &ep, Rpc::Summary, Duration::from_secs(2))?;
+        let status = request(worker, &ep, Rpc::UserStatus, Duration::from_secs(2))?;
+        Some((summary, status))
+    });
+    drop(TcpStream::connect(address).unwrap());
+    let calls = server.join().unwrap();
+    assert_eq!(result, Some((json!({"ok":true}), json!({"ok":true}))));
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].0.starts_with("POST /exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary "));
+    assert!(calls[1].0.starts_with("POST /exa.language_server_pb.LanguageServerService/GetUserStatus "));
+    assert!(calls.iter().all(|(_, authenticated, _)| *authenticated));
+    assert_eq!(calls[0].2["forceRefresh"], true);
+    assert_eq!(calls[1].2["metadata"]["ideName"], "antigravity");
 }
 
 #[test]

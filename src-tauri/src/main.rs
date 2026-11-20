@@ -5,6 +5,8 @@ mod cache;
 mod detail;
 mod engine;
 mod model;
+#[cfg(windows)]
+mod network;
 mod placement;
 mod popover;
 mod pricing;
@@ -293,6 +295,14 @@ async fn get_quotas(
 }
 
 #[tauri::command]
+fn record_banked_reset_panel(
+    quotas: State<'_, Arc<QuotaCache>>, limits_view: bool, codex_enabled: bool, read_failed: bool, count: Option<u64>, rendered: bool,
+)
+{
+    quotas.record_banked_reset_panel(limits_view, codex_enabled, read_failed, count, rendered);
+}
+
+#[tauri::command]
 async fn get_quota_history(
     quotas: State<'_, Arc<QuotaCache>>, store: State<'_, Arc<PreferencesStore>>, key: QuotaKey,
 ) -> Result<HistoryPreview, String>
@@ -395,12 +405,18 @@ fn tooltip(summary: &Summary, chinese: bool) -> String
 
 fn main()
 {
+    #[cfg(windows)]
+    if let Some(proxy) = network::proxy_server(std::env::args_os().skip(1).filter_map(|arg| arg.into_string().ok()))
+    {
+        // Forward the shortcut's setting to every HTTP worker before Tauri starts its threads.
+        std::env::set_var(network::PROXY_SERVER_ENV, proxy);
+    }
     tauri::Builder::default()
         .manage(WindowMemory::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| open(app, None)))
         .invoke_handler(tauri::generate_handler![
             details_ready, dismiss_window, get_view_state, remember_view, set_appearance, set_preferences, get_collection_status,
-            get_summary, get_activity, get_quotas, get_quota_history,
+            get_summary, get_activity, get_quotas, record_banked_reset_panel, get_quota_history,
             list_sessions, get_session_detail, refresh
         ])
         .on_window_event(|window, event| {

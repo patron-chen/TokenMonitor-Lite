@@ -31,6 +31,20 @@ Token Monitor Lite 受 Token Monitor 启发，是按个人的 Windows 本机用�
 
 运行中的 Antigravity 提供实时额度和重置时间。Lite 优先读取分组额度，旧版服务可回退到模型额度。套餐名暂时读不到时仍显示有效额度，包括剩余 0% 的窗口。Codex 显示最近的本地额度记录，并从已登录账号读取 Banked Reset 的可用次数和到期时间。点 `i` 查看各次的到期明细。配置 `DEEPSEEK_API_KEY` 或 `DEEPSEEK_KEY` 后可显示 DeepSeek API 余额。窗口重开先显示托盘进程中的上次结果，再刷新已过期的额度。个别工具读取失败时保留其上次结果。
 
+Codex Banked Reset、DeepSeek 余额、Antigravity 本机 RPC 和构建时的 Tokscale 下载共用 HTTP 请求接口。回环地址和 `NO_PROXY` 匹配的域名或 IP 直连（逗号分隔，`*` 匹配全部）。其余请求优先使用 Lite 的 `--proxy-server` 启动参数，然后按目标协议读取 `HTTP_PROXY` 或 `HTTPS_PROXY`，其次使用 `ALL_PROXY`。构建时下载使用构建进程的代理环境。
+
+Windows 快捷方式的「目标」可参照下例填写，将路径换成实际安装位置。更改参数后，从托盘退出 Lite，再用该快捷方式启动。
+
+```text
+"D:\Program Files\TokenMonitor-Lite\TokenMonitorLite.exe" --proxy-server=http://127.0.0.1:1080
+```
+
+启动参数和环境变量均未配置代理时，先读取当前 Windows 用户的代理设置（含 PAC），再回落到 WinHTTP 默认配置。HTTP 代理由 WinHTTP 使用，HTTPS、SOCKS5 或带凭据的代理使用系统 `curl.exe`。`socks5h://` 由代理解析域名。`socks5://` 使用本机 DNS，连接失败且未收到 HTTP 响应时，再用同一代理解析。
+
+排查 Codex Banked Reset 时，打开主页或额度页，点右下角刷新。等待额度读取结束后，可分享 `%LOCALAPPDATA%\TokenMonitorLite\logs\codex-banked-reset.log`。设置了 `TOKEN_MONITOR_LITE_DATA_DIR` 时，日志在该目录的 `logs` 下。日志自动记录账号凭据读取结果、代理来源与传输方式、HTTP 状态或错误码、可用次数、缓存来源和面板是否生成对应行。日志使用 UTC 时间，达到 128 KiB 后会在下次额度读取或启动时重新开始。令牌、账号 ID、代理地址及凭据、原始响应均不写入日志。
+
+Codex 和 DeepSeek 的外网额度请求分别等待最多约 20 秒，并为 PowerShell 启动单独预留时间。两个工具同时启用时会并行读取，一方超时仍保留另一方已返回的额度。
+
 ## 设置
 
 - **外观**选择跟随系统、简体中文或 English。语言设置保存在本机，切换后立即应用到详情窗口和托盘。也可调节背景不透明度（65%–100%）和标准、较大、最大三档字号。
@@ -57,6 +71,8 @@ git push origin v0.1.16
 重新运行可补传缺少的 ZIP，并复用已有同名资产。带预发行后缀的版本发布为 Pre-release。
 
 ### 开发与验证
+
+新增 HTTP 调用使用 `scripts/windows-http.ps1` 的 `Invoke-LiteHttpRequest`。它接收目标 URI、方法、请求头和请求体，下载文件时传入 `OutFile` 和 `MaxBytes`。代理选择集中在 `Get-LiteProxy`，各提供方只负责构造请求和解析响应。
 
 在仓库根目录运行。
 

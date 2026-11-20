@@ -232,6 +232,8 @@ export const backend = {
   summary: (period: Period) => invoke<Summary>('get_summary', { period }),
   activity: (force: boolean) => invoke<Activity>('get_activity', { force }),
   quotas: (force: boolean) => invoke<Quotas>('get_quotas', { force }),
+  bankedResetPanel: (limitsView: boolean, codexEnabled: boolean, readFailed: boolean, count: number | null, rendered: boolean) =>
+    invoke<void>('record_banked_reset_panel', { limitsView, codexEnabled, readFailed, count, rendered }),
   quotaHistory: (key: QuotaKey) => invoke<QuotaHistory>('get_quota_history', { key }),
   sessions: (period: Period, tool: string | null, query: string, page: number, preview: boolean) =>
     invoke<SessionPage>('list_sessions', { period, tool, query, page, preview }),

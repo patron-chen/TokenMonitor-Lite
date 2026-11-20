@@ -18,6 +18,17 @@ use crate::{
 
 #[cfg(windows)]
 mod antigravity;
+mod banked_log;
+use banked_log::BankedResetLog;
+
+#[cfg(all(windows, test))]
+mod proxy_tests;
+
+#[cfg(windows)]
+const QUOTA_SCRIPT: &str = concat!(include_str!("../../scripts/windows-http.ps1"), "\n", include_str!("quota_windows.ps1"));
+// One 20s HTTP request plus time for PowerShell startup and teardown.
+#[cfg(windows)]
+const REMOTE_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CODEX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const CODEX_HISTORY_LIMIT: usize = 1200;
@@ -74,13 +85,14 @@ pub struct QuotaCache
     snapshot: Mutex<Quotas>,
     refreshed: Mutex<Option<(Instant, ToolSelection)>>,
     history: Option<QuotaHistory>,
+    banked_log: BankedResetLog,
 }
 
 impl QuotaCache
 {
     pub fn new(root: &Path) -> Self
     {
-        Self { history: Some(QuotaHistory::new(root)), ..Self::default() }
+        Self { history: Some(QuotaHistory::new(root)), banked_log: BankedResetLog::new(root), ..Self::default() }
     }
 
     pub fn cached(&self, tools: ToolSelection) -> Option<Quotas>
@@ -102,8 +114,15 @@ impl QuotaCache
                 });
                 codex_quota(&sources.codex_sessions(), cutoff)
             }));
-            let providers = if sources.home_override.is_none() { windows_quota(&sources.codex_auth(), tools) }
-                else { Providers::default() };
+            let providers = if sources.home_override.is_none()
+            {
+                windows_quota(&sources.codex_auth(), tools, &self.banked_log)
+            }
+            else
+            {
+                if tools.codex { self.banked_log.write(format_args!("request skipped=source_home_override")); }
+                Providers::default()
+            };
             let (codex, history) = codex.map(|reader| reader.join().expect("Codex quota reader")).unwrap_or_default();
             (codex, providers, history)
         }))
@@ -115,6 +134,13 @@ impl QuotaCache
             .map_err(|_| "Could not read the local quota history.".into())
     }
 
+    pub fn record_banked_reset_panel(&self, limits_view: bool, codex_enabled: bool, read_failed: bool, count: Option<u64>, rendered: bool)
+    {
+        let view = if limits_view { "limits" } else { "home" };
+        let count = count.map_or_else(|| "unavailable".into(), |value| value.to_string());
+        self.banked_log.write(format_args!("panel view={view} codex_enabled={codex_enabled} read_failed={read_failed} count={count} rendered={rendered}"));
+    }
+
     fn refresh(
         &self, settings: QuotaSettings, force: bool,
         collect: impl FnOnce() -> (Option<ToolQuota>, Providers, Vec<Sample>),
@@ -123,14 +149,17 @@ impl QuotaCache
         // Opening a WebView can read the last snapshot while I/O is in flight.
         let mut refreshed = self.refreshed.lock().expect("quota refresh");
         let ttl = Duration::from_secs(u64::from(settings.refresh_minutes) * 60);
+        self.banked_log.begin(format_args!("refresh force={force} codex_enabled={}", settings.tools.codex));
         if !force && refreshed.is_some_and(|(at, tools)| tools == settings.tools && at.elapsed() < ttl)
         {
+            self.banked_log.write(format_args!("refresh result=cache_hit"));
             return self.cached(settings.tools).unwrap_or_default();
         }
+        let start = Instant::now();
         let (codex, providers, mut samples) = collect();
         let observed_at = Utc::now().timestamp_millis();
         let mut snapshot = self.snapshot.lock().expect("quota snapshot").clone();
-        snapshot.merge(codex, providers, observed_at, &mut samples);
+        let bank_source = snapshot.merge(codex, providers, observed_at, &mut samples);
         if let Some(history) = &self.history
         {
             if history.record(&samples, observed_at).is_err() { eprintln!("Could not save the local quota history."); }
@@ -138,6 +167,13 @@ impl QuotaCache
         *refreshed = Some((Instant::now(), settings.tools));
         let result = snapshot.for_tools(settings.tools);
         *self.snapshot.lock().expect("quota snapshot") = snapshot;
+        if settings.tools.codex
+        {
+            let bank = result.tools.iter().find(|row| row.tool == "codex").and_then(|row| row.banked_reset.as_ref());
+            let count = bank.map_or_else(|| "unavailable".into(), |bank| bank.available_count.to_string());
+            let expirations = bank.map_or(0, |bank| bank.expirations.len());
+            self.banked_log.write(format_args!("quota source={bank_source} count={count} future_expirations={expirations} elapsed_ms={}", start.elapsed().as_millis()));
+        }
         result
     }
 }
@@ -151,7 +187,7 @@ impl Quotas
         result
     }
 
-    fn merge(&mut self, codex: Option<ToolQuota>, providers: Providers, now: i64, samples: &mut Vec<Sample>)
+    fn merge(&mut self, codex: Option<ToolQuota>, providers: Providers, now: i64, samples: &mut Vec<Sample>) -> &'static str
     {
         self.checked_at = Some(now);
         let previous = |tool| self.tools.iter().find(|quota| quota.tool == tool).cloned();
@@ -165,10 +201,13 @@ impl Quotas
         {
             self.observed_at = now;
         }
-        let bank = bank.or_else(|| previous_codex.as_ref().and_then(|quota| quota.banked_reset.clone()));
+        let previous_bank = previous_codex.as_ref().and_then(|quota| quota.banked_reset.as_ref());
+        let bank_source = if bank.is_some() { "response" } else if previous_bank.is_some() { "previous" } else { "none" };
+        let bank = bank.or_else(|| previous_bank.cloned());
         let codex = add_banked_reset(codex.or(previous_codex), bank, now);
         self.tools = [antigravity.or_else(|| previous("antigravity")), codex,
             deepseek.or_else(|| previous("dsh"))].into_iter().flatten().collect();
+        bank_source
     }
 }
 
@@ -429,40 +468,42 @@ fn deepseek_quota(data: &Value, observed_at: i64) -> Option<ToolQuota>
 }
 
 #[cfg(windows)]
-fn windows_quota(codex_auth: &Path, tools: ToolSelection) -> Providers
+fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &BankedResetLog) -> Providers
 {
     std::thread::scope(|scope| {
-        // Keep a completed local RPC result even if a remote balance request fails or times out.
-        let local = tools.antigravity.then(|| scope.spawn(antigravity::read));
-        let mut providers = if tools.codex || tools.dsh
-        {
-            let remote_tools = ToolSelection { antigravity: false, ..tools }.enabled().collect::<Vec<_>>().join(",");
-            powershell_json(include_str!("quota_windows.ps1"), &[
+        let remote = |tool: &str| -> Providers {
+            let log_path = log.path.as_deref().filter(|_| tool == "codex").map(Path::as_os_str).unwrap_or_default();
+            powershell_json(QUOTA_SCRIPT, &[
                 ("TOKEN_MONITOR_LITE_CODEX_AUTH", codex_auth.as_os_str()),
-                ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", remote_tools.as_ref()),
-            ], Duration::from_secs(13)).unwrap_or_default()
+                ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", tool.as_ref()),
+                ("TOKEN_MONITOR_LITE_BANKED_LOG", log_path),
+            ], REMOTE_HELPER_TIMEOUT).unwrap_or_else(|reason| {
+                if tool == "codex" { log.write(format_args!("helper failure={reason}")); }
+                eprintln!("Windows {tool} quota helper failed: {reason}");
+                Providers::default()
+            })
+        };
+        let local = tools.antigravity.then(|| scope.spawn(antigravity::read));
+        let read_balance = tools.dsh && ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"].iter()
+            .any(|name| std::env::var_os(name).is_some_and(|key| !key.is_empty()));
+        // A slow balance request must not consume the reset request's deadline or discard its result.
+        let balance = read_balance.then(|| scope.spawn(move || remote("dsh").deepseek));
+        let codex_reset = if tools.codex { remote("codex").codex_reset } else { Value::Null };
+        Providers {
+            antigravity: local.and_then(|worker| worker.join().expect("Antigravity quota reader")),
+            codex_reset,
+            deepseek: balance.map(|worker| worker.join().expect("DeepSeek quota reader")).unwrap_or_default(),
         }
-        else { Providers::default() };
-        providers.antigravity = local.and_then(|worker| worker.join().expect("Antigravity quota reader"));
-        providers
     })
 }
 
 #[cfg(windows)]
 fn powershell_json<T: serde::de::DeserializeOwned + Send>(
     script: &str, vars: &[(&str, &std::ffi::OsStr)], timeout: Duration,
-) -> Option<T>
+) -> Result<T, String>
 {
-    use std::{env, os::windows::process::CommandExt, process::{Command, Stdio}, thread};
-    use windows_sys::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW};
-
-    let root = env::var_os("SystemRoot")?;
-    let powershell = PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let mut child = Command::new(powershell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .envs(vars.iter().copied())
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW).spawn().ok()?;
+    use std::{process::Stdio, thread};
+    let mut child = crate::network::start_powershell(script, vars, Stdio::null()).ok_or("spawn_failed")?;
     let stdout = child.stdout.take().expect("piped quota response");
     thread::scope(|scope| {
         let reader = scope.spawn(move || serde_json::from_reader(BufReader::new(stdout)));
@@ -474,27 +515,29 @@ fn powershell_json<T: serde::de::DeserializeOwned + Send>(
                 Ok(Some(status)) if status.success() => break,
                 Ok(Some(status)) =>
                 {
-                    eprintln!("Windows quota helper exited with {status}.");
-                    return None;
+                    return Err(format!("exit code={}", status.code().unwrap_or(-1)));
                 }
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                _ =>
+                state =>
                 {
                     let _ = child.kill();
                     let _ = child.wait();
-                    eprintln!("Windows quota helper did not finish.");
-                    return None;
+                    return Err(match state
+                    {
+                        Err(error) => format!("wait_failed os_code={}", error.raw_os_error().unwrap_or(-1)),
+                        _ => format!("timeout limit_ms={}", timeout.as_millis()),
+                    });
                 }
             }
         }
         reader.join().expect("quota response reader").map_err(|err| {
-            eprintln!("Invalid quota helper response at line {}, column {}.", err.line(), err.column());
-        }).ok()
+            format!("invalid_json line={} column={}", err.line(), err.column())
+        })
     })
 }
 
 #[cfg(not(windows))]
-fn windows_quota(_: &Path, _: ToolSelection) -> Providers { Providers::default() }
+fn windows_quota(_: &Path, _: ToolSelection, _: &BankedResetLog) -> Providers { Providers::default() }
 
 #[cfg(test)]
 mod tests
@@ -524,7 +567,9 @@ mod tests
     #[test]
     fn cached_limits_are_readable_during_refresh_and_preserve_failed_sources()
     {
-        let cache = QuotaCache::default();
+        let log = std::env::temp_dir().join(format!("token-monitor-banked-cache-{}.log", std::process::id()));
+        fs::write(&log, vec![b'x'; 128 * 1024]).unwrap();
+        let cache = QuotaCache { banked_log: BankedResetLog { path: Some(log.clone()) }, ..QuotaCache::default() };
         let settings = QuotaSettings::default();
         assert!(cache.cached(settings.tools).is_none());
         let codex = |used| parse_codex(&json!({
@@ -557,6 +602,14 @@ mod tests
         assert_eq!(just_balance.tools.iter().map(|tool| tool.tool).collect::<Vec<_>>(), ["dsh"]);
         assert_eq!(cache.cached(settings.tools).unwrap().tools.len(), 2);
         assert_eq!(cache.refresh(without_codex, false, || panic!("fresh selection was rescanned")).tools.len(), 1);
+        let trace = fs::read_to_string(&log).unwrap();
+        fs::remove_file(log).unwrap();
+        assert!(!trace.contains("xxxx"));
+        for expected in ["source=response count=2", "source=previous count=2", "source=response count=0",
+            "codex_enabled=false", "result=cache_hit"]
+        {
+            assert!(trace.contains(expected));
+        }
     }
 
     #[test]

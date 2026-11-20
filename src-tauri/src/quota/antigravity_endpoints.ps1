@@ -76,4 +76,4 @@ function Get-AntigravityEndpoints
     }
 }
 
-ConvertTo-Json -Compress -InputObject @(Get-AntigravityEndpoints)
+[Console]::WriteLine((ConvertTo-Json -Compress -InputObject @(Get-AntigravityEndpoints)))

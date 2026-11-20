@@ -1,14 +1,55 @@
 'use strict';
 
 const { createHash } = require('node:crypto');
-const { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } = require('node:fs');
+const { execFile } = require('node:child_process');
+const { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } = require('node:fs');
 const { join } = require('node:path');
+const { promisify } = require('node:util');
 const pin = require('./tokscale.json');
 
 const directory = join(__dirname, '..', 'vendor');
 const scanner = join(directory, 'tokscale.exe');
 const maxBytes = 50 * 1024 * 1024;
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+const run = promisify(execFile);
+
+async function download(url, staged)
+{
+  const powershell = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+  const helper = readFileSync(join(__dirname, 'windows-http.ps1'), 'utf8');
+  const command = helper + "\n$ErrorActionPreference = 'Stop'\n" +
+    'Invoke-LiteHttpRequest -Uri $env:LITE_DOWNLOAD_URL -OutFile $env:LITE_DOWNLOAD_PATH ' +
+    '-MaxBytes $env:LITE_DOWNLOAD_LIMIT -TimeoutMs $env:LITE_DOWNLOAD_TIMEOUT | ConvertTo-Json -Compress';
+  const deadline = Date.now() + 60_000;
+  // A GitHub redirect can change hosts. Resolve proxy and bypass rules again at each hop.
+  for (let redirects = 0; redirects <= 10; redirects++)
+  {
+    const timeout = deadline - Date.now();
+    if (timeout <= 0) throw new Error('Tokscale download timed out.');
+    if (url.protocol !== 'https:') throw new Error('Tokscale download requires HTTPS.');
+    let reply;
+    try
+    {
+      const { stdout } = await run(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], {
+        windowsHide: true, timeout,
+        env: { ...process.env, LITE_DOWNLOAD_URL: url.href, LITE_DOWNLOAD_PATH: staged,
+          LITE_DOWNLOAD_LIMIT: String(maxBytes), LITE_DOWNLOAD_TIMEOUT: String(timeout) }
+      });
+      reply = JSON.parse(stdout);
+    }
+    catch
+    {
+      throw new Error(`Tokscale download failed while connecting to ${url.hostname}.`);
+    }
+    if (reply.Status === 200) return;
+    if (![301, 302, 303, 307, 308].includes(reply.Status) || !reply.Location)
+    {
+      throw new Error(`Tokscale download failed (HTTP ${reply.Status}): ${url.hostname}`);
+    }
+    url = new URL(reply.Location, url);
+  }
+  throw new Error('Too many Tokscale download redirects.');
+}
 
 async function ensureTokscale()
 {
@@ -23,21 +64,17 @@ async function ensureTokscale()
   }
 
   const url = `https://github.com/${pin.releaseRepo}/releases/download/${pin.releaseTag}/${pin.asset}`;
-  const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
-  if (!response.ok) throw new Error(`Tokscale download failed (${response.status}): ${url}`);
-  if (Number(response.headers.get('content-length')) > maxBytes) throw new Error('Tokscale download exceeds 50 MiB.');
-  const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.length > maxBytes || sha256(bytes) !== pin.sha256)
-  {
-    throw new Error(`Tokscale SHA-256 mismatch: ${url}`);
-  }
-
   // Replace only after the verified download is fully written.
   mkdirSync(directory, { recursive: true });
   const staged = join(directory, `tokscale.${process.pid}.tmp`);
   try
   {
-    writeFileSync(staged, bytes);
+    await download(new URL(url), staged);
+    const bytes = readFileSync(staged);
+    if (bytes.length > maxBytes || sha256(bytes) !== pin.sha256)
+    {
+      throw new Error(`Tokscale SHA-256 mismatch: ${url}`);
+    }
     renameSync(staged, scanner);
   }
   finally

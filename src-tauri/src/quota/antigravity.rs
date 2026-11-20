@@ -1,14 +1,11 @@
-use std::{ffi::c_void, ptr::{self, NonNull}, time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::Value;
-use windows::{
-    core::{w, HSTRING, PCWSTR},
-    Win32::Networking::WinHttp::*,
-};
+use serde_json::{json, Value};
 
-use super::{antigravity_quota, powershell_json, ToolQuota};
+use crate::network::{with_http_worker, HttpWorker};
+use super::{antigravity_quota, ToolQuota};
 
 #[cfg(test)]
 mod tests;
@@ -27,13 +24,13 @@ enum Rpc { Summary, UserStatus, ModelConfigs }
 
 pub(super) fn read() -> Option<ToolQuota>
 {
+    const SCRIPT: &str = concat!(include_str!("../../../scripts/windows-http.ps1"), "\n",
+        include_str!("antigravity_endpoints.ps1"), "\nRead-LiteHttpRequests");
     let deadline = Instant::now() + Duration::from_secs(13);
-    let endpoints: Vec<Endpoint> = powershell_json(include_str!("antigravity_endpoints.ps1"), &[], Duration::from_secs(8))?;
-    if endpoints.is_empty() { return None; }
-    let client = unsafe {
-        Handle::new(WinHttpOpen(w!("Token Monitor Lite"), WINHTTP_ACCESS_TYPE_NO_PROXY, PCWSTR::null(), PCWSTR::null(), 0))?
-    };
-    probe(&endpoints, deadline, |endpoint, rpc, timeout| client.request(endpoint, rpc, timeout))
+    with_http_worker(SCRIPT, deadline, |worker| {
+        let endpoints: Vec<Endpoint> = worker.read_json(Duration::from_secs(8))?;
+        probe(&endpoints, deadline, |endpoint, rpc, timeout| request(worker, endpoint, rpc, timeout))
+    })
 }
 
 fn plan(status: &Value) -> Option<String>
@@ -89,76 +86,22 @@ fn probe(
     None
 }
 
-// WinHTTP owns distinct session, connection and request handles, including on early returns.
-struct Handle(NonNull<c_void>);
-
-impl Drop for Handle
+fn request(worker: &mut HttpWorker, endpoint: &Endpoint, rpc: Rpc, timeout: Duration) -> Option<Value>
 {
-    fn drop(&mut self) { unsafe { let _ = WinHttpCloseHandle(self.0.as_ptr()); } }
-}
-
-impl Handle
-{
-    fn new(raw: *mut c_void) -> Option<Self> { NonNull::new(raw).map(Self) }
-
-    fn option(&self, name: u32, value: u32) -> Option<()>
+    let method = match rpc
     {
-        unsafe { WinHttpSetOption(Some(self.0.as_ptr()), name, Some(&value.to_ne_bytes())).ok() }
-    }
-
-    fn request(&self, endpoint: &Endpoint, rpc: Rpc, timeout: Duration) -> Option<Value>
-    {
-        let method = match rpc
-        {
-            Rpc::Summary => "RetrieveUserQuotaSummary",
-            Rpc::UserStatus => "GetUserStatus",
-            Rpc::ModelConfigs => "GetCommandModelConfigs",
-        };
-        let path = HSTRING::from(format!("/exa.language_server_pb.LanguageServerService/{method}"));
-        let body: &[u8] = if rpc == Rpc::Summary { br#"{"forceRefresh":true}"# }
-            else { br#"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","ideVersion":"unknown","locale":"en"}}"# };
-        let mut headers = String::from("Content-Type: application/json\r\nConnect-Protocol-Version: 1\r\n");
-        if !endpoint.csrf.is_empty()
-        {
-            if endpoint.csrf.contains(['\r', '\n']) { return None; }
-            headers.push_str(&format!("X-Codeium-Csrf-Token: {}\r\n", endpoint.csrf));
-        }
-        let headers: Vec<u16> = headers.encode_utf16().collect();
-        let deadline = Instant::now() + timeout;
-        let ms = timeout.as_millis().max(1) as i32;
-        unsafe
-        {
-            let connection = Handle::new(WinHttpConnect(self.0.as_ptr(), w!("127.0.0.1"), endpoint.port, 0))?;
-            let flags = if endpoint.secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
-            let request = Handle::new(WinHttpOpenRequest(connection.0.as_ptr(), w!("POST"), &path,
-                PCWSTR::null(), PCWSTR::null(), ptr::null(), flags))?;
-            let raw = request.0.as_ptr();
-            request.option(WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER)?;
-            request.option(WINHTTP_OPTION_AUTOLOGON_POLICY, WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH)?;
-            if endpoint.secure
-            {
-                // The loopback service presents its own certificate. Keep the exception on this request.
-                request.option(WINHTTP_OPTION_SECURITY_FLAGS, SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID)?;
-            }
-            WinHttpSetTimeouts(raw, ms.min(800), ms.min(800), ms.min(1000), ms).ok()?;
-            WinHttpSendRequest(raw, Some(&headers), Some(body.as_ptr().cast()), body.len() as u32, body.len() as u32, 0).ok()?;
-            WinHttpReceiveResponse(raw, ptr::null_mut()).ok()?;
-            let mut status = 0_u32;
-            let mut size = size_of::<u32>() as u32;
-            WinHttpQueryHeaders(raw, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, PCWSTR::null(),
-                Some((&raw mut status).cast()), &mut size, ptr::null_mut()).ok()?;
-            if status != 200 { return None; }
-
-            let mut bytes = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            while Instant::now() < deadline
-            {
-                let mut read = 0;
-                WinHttpReadData(raw, buffer.as_mut_ptr().cast(), buffer.len() as u32, &mut read).ok()?;
-                if read == 0 { return serde_json::from_slice(&bytes).ok(); }
-                bytes.extend_from_slice(&buffer[..read as usize]);
-            }
-            None
-        }
-    }
+        Rpc::Summary => "RetrieveUserQuotaSummary",
+        Rpc::UserStatus => "GetUserStatus",
+        Rpc::ModelConfigs => "GetCommandModelConfigs",
+    };
+    let scheme = if endpoint.secure { "https" } else { "http" };
+    let uri = format!("{scheme}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/{method}", endpoint.port);
+    let body = if rpc == Rpc::Summary { r#"{"forceRefresh":true}"# }
+        else { r#"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","ideVersion":"unknown","locale":"en"}}"# };
+    let mut headers = json!({"Content-Type":"application/json", "Connect-Protocol-Version":"1"});
+    if !endpoint.csrf.is_empty() { headers["X-Codeium-Csrf-Token"] = json!(endpoint.csrf); }
+    worker.request_json(&json!({
+        "Uri": uri, "Method": "POST", "Headers": headers, "Body": body,
+        "TimeoutMs": timeout.as_millis().max(1) as u64, "LocalServiceCertificate": endpoint.secure,
+    }))
 }

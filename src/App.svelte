@@ -225,6 +225,16 @@
     catch { /* Keep the last completed activity view. */ }
   }
 
+  async function recordBankedResetPanel(request: number, readFailed: boolean)
+  {
+    // Check the committed DOM so a positive backend count can be compared with the row on screen.
+    await tick();
+    if (request !== quotaRequest || !quotaVisible) return;
+    const count = shownQuotas?.tools.find(provider => provider.tool === 'codex')?.bankedReset?.availableCount ?? null;
+    const rendered = !!viewport?.querySelector('.quota-banked');
+    await backend.bankedResetPanel(route.view === 'limits', preferences.quotas.tools.codex, readFailed, count, rendered).catch(() => {});
+  }
+
   async function loadQuotas(force = false)
   {
     if (!quotaVisible) return;
@@ -233,10 +243,12 @@
       quotaRequest++;
       quotas = null;
       quotaLoading = false;
+      void recordBankedResetPanel(quotaRequest, false);
       return;
     }
     if (quotaLoading && !force) return;
     const request = ++quotaRequest;
+    let readFailed = false;
     quotaLoading = true;
     try
     {
@@ -250,8 +262,16 @@
     {
       if (request !== quotaRequest) return;
       lastQuotaCheck = Date.now();
+      readFailed = true;
     }
-    finally { if (request === quotaRequest) quotaLoading = false; }
+    finally
+    {
+      if (request === quotaRequest)
+      {
+        quotaLoading = false;
+        void recordBankedResetPanel(request, readFailed);
+      }
+    }
   }
 
   async function loadCollection()
