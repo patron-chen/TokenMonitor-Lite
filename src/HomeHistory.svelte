@@ -63,7 +63,7 @@
       aria-label={local(`Daily activity, ${history.count} active days`, `按日活动，活跃 ${history.count} 天`)}>
       {#each history.cells as cell (cell.date)}
         <span data-level={cell.future ? -1 : Math.ceil(4 * Math.sqrt(cell.tokens / history.peak))}
-          title={cell.future ? undefined : day.format(cell.at) + ' · ' + number(cell.tokens) + ' Token'}></span>
+          title={cell.future ? undefined : day.format(cell.at) + ' · ' + compact(cell.tokens) + ' Token'}></span>
       {/each}
     </div>
     <div class="activity-months" style:--activity-columns={weekColumns} aria-hidden="true">
