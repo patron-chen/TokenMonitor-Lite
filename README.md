@@ -39,7 +39,26 @@ Token Monitor Lite 受 Token Monitor 启发，是按个人的 Windows 本机用�
 
 ## 构建
 
-在仓库根目录运行。需要 Windows x64、Node.js 22.15+、Rust MSVC 工具链与 Windows SDK。
+需要 Windows x64、Node.js 22.15+（含 npm）、Rust MSVC 工具链、Windows SDK 与 `tar.exe`。
+
+### 一键打包
+
+双击仓库根目录的 `package-win.cmd`。脚本会检查工具链、准备前端依赖、校验 Tokscale 并构建便携版。生成的 ZIP 位于 `release/`，运行结果会保留在命令窗口里。依赖已安装时，也可以从终端执行 `npm run dist:win`。
+
+### GitHub 发布
+
+同步 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的应用版本并提交。推送与版本匹配的 `v` 标签后，Actions 会在 Windows x64 上执行检查和打包，将 `Token-Monitor-Lite-<版本>-win-x64.zip` 上传到对应的 GitHub Release。
+
+```powershell
+git tag -a v0.1.13 -m "Token Monitor Lite 0.1.13"
+git push origin v0.1.13
+```
+
+重新运行可补传缺少的 ZIP，并复用已有同名资产。带预发行后缀的版本发布为 Pre-release。
+
+### 开发与验证
+
+在仓库根目录运行。
 
 ```powershell
 npm ci
@@ -47,18 +66,17 @@ npm run check
 npm run dev
 ```
 
-开发和打包使用 `scripts/tokscale.json` 固定的 Tokscale 4.23.0 构建。首次准备扫描器时下载并校验 SHA-256，之后复用 `vendor/tokscale.exe`。可用 `npm run ensure:tokscale` 单独准备扫描器。
-
-离线构建可提前将对应的 Windows x64 资产保存为 `vendor/tokscale.exe`，打包时会校验哈希。[固定版本发布页](https://github.com/Javis603/tokscale/releases/tag/token-monitor-648cc594)
-
-便携 ZIP 输出到 `release/`。
-
 ```powershell
 npm run build
 cargo test --locked --manifest-path src-tauri/Cargo.toml --features custom-protocol
-npm run dist:win
 ```
 
 测试时可为新进程设置 `TOKEN_MONITOR_LITE_DATA_DIR`（应用数据）与 `TOKEN_MONITOR_LITE_SOURCE_HOME`（工具日志），两者均使用绝对路径。追加 `--open` 可直接打开详情。
 
 用 `node tests/make-fixture.cjs tmp/新的样例目录` 生成三个工具的脱敏样例和期待总数，含跨周期记录和 100 条以上的会话。将输出中的 `home` 设为测试日志目录。
+
+### Tokscale 版本
+
+`scripts/tokscale.json` 锁定发布仓库、标签、源码提交、Windows x64 资产与 SHA-256。当前使用基于 4.23.0 的 Token Monitor 分支构建。`npm run ensure:tokscale` 校验本地 `vendor/tokscale.exe`，需要时下载固定发布的资产。离线准备时，可以提前将对应资产保存到该路径。[固定版本发布页](https://github.com/Javis603/tokscale/releases/tag/token-monitor-648cc594)
+
+升级时，将 `version`、`releaseRepo`、`releaseTag`、`commit`、`asset` 和 `sha256` 一起更新为目标构建的数据。用样例核对时区分桶、会话与模型分组，以及 Codex、Antigravity 和 DeepSeek Harness 的统计，再重新打包。Lite 的扫描器调用需要支持 `--bucket-timezone` 和 `--group-by client,workspace,session,model`。
