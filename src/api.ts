@@ -107,6 +107,7 @@ export interface ToolQuota
 {
   tool: ToolId;
   plan: string | null;
+  source?: 'online';
   observedAt: number;
   windows: QuotaWindow[];
   balances: QuotaBalance[];

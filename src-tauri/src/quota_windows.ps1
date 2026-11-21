@@ -12,6 +12,7 @@ function Write-QuotaTrace([string]$Source, [string]$Message)
 }
 
 function Write-BankedResetTrace([string]$Message) { Write-QuotaTrace 'banked_reset' $Message }
+function Write-CodexUsageTrace([string]$Message) { Write-QuotaTrace 'codex_usage trigger=startup' $Message }
 
 function Get-QuotaResponse([uri]$Uri, $Headers, [scriptblock]$Trace)
 {
@@ -46,27 +47,27 @@ function Get-QuotaResponse([uri]$Uri, $Headers, [scriptblock]$Trace)
     return $null
 }
 
-function Get-CodexBankedReset
+function Get-CodexHeaders([scriptblock]$Trace)
 {
     $stage = 'auth_read'
     try
     {
-        Write-BankedResetTrace "auth lookup codex_home_set=$(![string]::IsNullOrWhiteSpace($env:CODEX_HOME))"
-        if (!$env:TOKEN_MONITOR_LITE_CODEX_AUTH) { Write-BankedResetTrace 'auth result=no_path'; return $null }
+        & $Trace "auth lookup codex_home_set=$(![string]::IsNullOrWhiteSpace($env:CODEX_HOME))"
+        if (!$env:TOKEN_MONITOR_LITE_CODEX_AUTH) { & $Trace 'auth result=no_path'; return $null }
         if (!(Test-Path -LiteralPath $env:TOKEN_MONITOR_LITE_CODEX_AUTH -PathType Leaf))
         {
-            Write-BankedResetTrace 'auth result=file_missing'
+            & $Trace 'auth result=file_missing'
             return $null
         }
         $contents = Get-Content -Raw -LiteralPath $env:TOKEN_MONITOR_LITE_CODEX_AUTH
         $stage = 'auth_json'
-        if ([string]::IsNullOrWhiteSpace($contents)) { Write-BankedResetTrace 'auth result=empty_file'; return $null }
+        if ([string]::IsNullOrWhiteSpace($contents)) { & $Trace 'auth result=empty_file'; return $null }
         $auth = ConvertFrom-Json -InputObject $contents
         $tokens = if ($auth.tokens) { $auth.tokens } else { $auth }
         $access = ([string]$tokens.access_token).Trim()
         if (!$access)
         {
-            Write-BankedResetTrace "auth result=no_access_token api_key_present=$([bool]$auth.OPENAI_API_KEY)"
+            & $Trace "auth result=no_access_token api_key_present=$([bool]$auth.OPENAI_API_KEY)"
             return $null
         }
         $headers = @{
@@ -76,11 +77,36 @@ function Get-CodexBankedReset
             'originator' = 'Codex Desktop'
         }
         if ($tokens.account_id) { $headers['ChatGPT-Account-Id'] = [string]$tokens.account_id }
-        Write-BankedResetTrace "auth result=ready account_header=$($headers.ContainsKey('ChatGPT-Account-Id'))"
+        & $Trace "auth result=ready account_header=$($headers.ContainsKey('ChatGPT-Account-Id'))"
+        return $headers
+    }
+    catch
+    {
+        $code = '{0:X8}' -f $_.Exception.GetBaseException().HResult
+        & $Trace "failure stage=$stage hresult=0x$code"
+    }
+    return $null
+}
+
+function Get-CodexUsage
+{
+    $trace = ${function:Write-CodexUsageTrace}
+    $headers = Get-CodexHeaders $trace
+    if ($null -eq $headers) { return @{ error = 'auth_unavailable' } }
+    $usage = Get-QuotaResponse 'https://chatgpt.com/backend-api/wham/usage' $headers $trace
+    if ($null -eq $usage) { return @{ error = 'no_usage_response' } }
+    $account = if ($usage.account_id) { $usage.account_id } else { $headers['ChatGPT-Account-Id'] }
+    return @{ rate_limit = $usage.rate_limit; plan_type = $usage.plan_type; account_id = $account }
+}
+
+function Get-CodexBankedReset
+{
+    $headers = Get-CodexHeaders ${function:Write-BankedResetTrace}
+    if ($null -eq $headers) { return $null }
+    try
+    {
         # This reads the signed-in account's reset inventory from the first-party host.
-        $stage = 'response_fields'
-        $trace = ${function:Write-BankedResetTrace}
-        $result = Get-QuotaResponse 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits' $headers $trace
+        $result = Get-QuotaResponse 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits' $headers ${function:Write-BankedResetTrace}
         if ($null -ne $result)
         {
             $available = if ($null -ne $result.available_count) { $result.available_count } else { $result.availableCount }
@@ -101,12 +127,13 @@ function Get-CodexBankedReset
     catch
     {
         $code = '{0:X8}' -f $_.Exception.GetBaseException().HResult
-        Write-BankedResetTrace "failure stage=$stage hresult=0x$code"
+        Write-BankedResetTrace "failure stage=response_fields hresult=0x$code"
     }
     return $null
 }
 
 $tools = $env:TOKEN_MONITOR_LITE_QUOTA_TOOLS -split ','
+$codexUsage = if ($tools -contains 'codex_usage') { Get-CodexUsage }
 $codexReset = if ($tools -contains 'codex') { Get-CodexBankedReset }
 $deepseek = if ($tools -contains 'dsh')
 {
@@ -114,4 +141,4 @@ $deepseek = if ($tools -contains 'dsh')
     if (!$deepseekKey) { $deepseekKey = $env:DEEPSEEK_KEY }
     if ($deepseekKey) { Get-QuotaResponse 'https://api.deepseek.com/user/balance' @{ Authorization = "Bearer $($deepseekKey.Trim())" } }
 }
-ConvertTo-Json -Compress -Depth 20 -InputObject @{ codex_reset = $codexReset; deepseek = $deepseek }
+ConvertTo-Json -Compress -Depth 20 -InputObject @{ codex_usage = $codexUsage; codex_reset = $codexReset; deepseek = $deepseek }

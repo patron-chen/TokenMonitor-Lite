@@ -51,6 +51,8 @@ struct ToolQuota
     plan: Option<String>,
     #[serde(skip)]
     account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
     observed_at: i64,
     windows: Vec<QuotaWindow>,
     balances: Vec<Balance>,
@@ -127,7 +129,7 @@ impl QuotaCache
     pub fn cached(&self, tools: ToolSelection) -> Option<Quotas>
     {
         let snapshot = self.snapshot.lock().expect("quota snapshot");
-        snapshot.checked_at.map(|_| snapshot.for_tools(tools))
+        (snapshot.checked_at.is_some() || !snapshot.tools.is_empty()).then(|| snapshot.for_tools(tools))
     }
 
     pub fn read(&self, sources: &Sources, settings: QuotaSettings, force: bool) -> Quotas
@@ -189,6 +191,63 @@ impl QuotaCache
         forecast::reset(history, key, window, now).map_err(|_| "Could not save the forecast reset.".to_owned())?;
         snapshot.observed_at = snapshot.observed_at.max(now);
         Ok(snapshot.for_tools(tools))
+    }
+
+    fn sample_startup(
+        &self, sources: &Sources, local_tools: ToolSelection,
+        fetch: Option<impl FnOnce() -> Result<ToolQuota, String> + Send>, changed: &impl Fn(),
+    )
+    {
+        std::thread::scope(|scope| {
+            let start = Instant::now();
+            // Load the local baseline and Antigravity while the startup GET is in flight.
+            let online = fetch.map(|fetch| scope.spawn(fetch));
+            if local_tools.any()
+            {
+                self.sample_local(sources, local_tools, "startup");
+                changed();
+            }
+            let Some(online) = online else { return };
+            let tools = ToolSelection { codex: true, antigravity: false, dsh: false };
+            match online.join().expect("startup Codex quota reader")
+            {
+                Ok(row) =>
+                {
+                    self.log.reading("startup", "codex", "online", "read", Some(&row));
+                    self.publish_samples(tools, "startup", vec![row], start);
+                    changed();
+                }
+                Err(reason) =>
+                {
+                    self.log.write(format_args!("quota read trigger=startup tool=codex source=online result=failed reason={reason}"));
+                    let local = self.snapshot.lock().expect("quota snapshot").tools.iter()
+                        .find(|row| row.tool == "codex" && !row.windows.is_empty()).cloned();
+                    if let Some(row) = local
+                    {
+                        self.log.reading("startup", "codex", "local_history", "fallback", Some(&row));
+                    }
+                    else
+                    {
+                        // Quota-only mode can recover from the same logs used by a panel refresh.
+                        let (row, _) = codex_quota(&sources.codex_sessions(), None, &self.log, "startup");
+                        let status = if row.is_some() { "fallback" } else { "fallback_unavailable" };
+                        self.log.reading("startup", "codex", "session_logs", status, row.as_ref());
+                        if let Some(row) = row
+                        {
+                            self.publish_samples(tools, "startup", vec![row], start);
+                            changed();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn fetch_startup_codex(&self, sources: &Sources) -> Result<ToolQuota, String>
+    {
+        if sources.home_override.is_some() { return Err("source_home_override".into()); }
+        self.log.reading("startup", "codex", "online", "started", None);
+        online_codex_quota(&sources.codex_auth(), &self.log)
     }
 
     fn sample_local(&self, sources: &Sources, tools: ToolSelection, trigger: &str)
@@ -511,15 +570,6 @@ fn parse_codex(value: &Value) -> Option<ToolQuota>
     let limits = &payload["rate_limits"];
     if limits["limit_id"].as_str().is_some_and(|id| id != "codex") { return None; }
     let observed_at = reset_time(&value["timestamp"])?;
-    let plan = limits["plan_type"].as_str().filter(|name| !name.is_empty()).map(|name| match name
-    {
-        "prolite" => "Pro 100",
-        "pro" => "Pro 200",
-        "promax" => "Pro 500",
-        "plus" => "Plus",
-        "free" => "Free",
-        other => other,
-    }.to_owned());
     let mut windows: Vec<_> = ["primary", "secondary"].into_iter().filter_map(|key| {
         let window = &limits[key];
         Some(QuotaWindow {
@@ -530,7 +580,42 @@ fn parse_codex(value: &Value) -> Option<ToolQuota>
     }).collect();
     windows.sort_by_key(|window| window.minutes);
     (!windows.is_empty()).then_some(ToolQuota {
-        tool: "codex", plan, account: account_tag(limits["account_id"].as_str()), observed_at, windows, balances: vec![], banked_reset: None,
+        tool: "codex", plan: codex_plan(&limits["plan_type"]), account: account_tag(limits["account_id"].as_str()),
+        source: None, observed_at, windows, balances: vec![], banked_reset: None,
+    })
+}
+
+fn codex_plan(value: &Value) -> Option<String>
+{
+    value.as_str().filter(|name| !name.is_empty()).map(|name| match name
+    {
+        "prolite" => "Pro 100",
+        "pro" => "Pro 200",
+        "promax" => "Pro 500",
+        "plus" => "Plus",
+        "free" => "Free",
+        other => other,
+    }.to_owned())
+}
+
+#[cfg(windows)]
+fn parse_online_codex(value: &Value, observed_at: i64) -> Option<ToolQuota>
+{
+    let mut windows: Vec<_> = ["primary_window", "secondary_window"].into_iter().filter_map(|key| {
+        let window = &value["rate_limit"][key];
+        let seconds = window["limit_window_seconds"].as_u64()?;
+        // The weekly window can appear first when the service only reports one window.
+        if !matches!(seconds, 18_000 | 604_800) { return None; }
+        Some(QuotaWindow {
+            group: String::new(), minutes: Some(seconds / 60),
+            remaining: (100.0 - window["used_percent"].as_f64()?).clamp(0.0, 100.0),
+            resets_at: reset_time(&window["reset_at"]), forecast_reset_at: None, forecast: None,
+        })
+    }).collect();
+    windows.sort_by_key(|window| window.minutes);
+    (!windows.is_empty()).then_some(ToolQuota {
+        tool: "codex", plan: codex_plan(&value["plan_type"]), account: account_tag(value["account_id"].as_str()),
+        source: Some("online"), observed_at, windows, balances: vec![], banked_reset: None,
     })
 }
 
@@ -538,7 +623,7 @@ fn add_banked_reset(codex: Option<ToolQuota>, banked_reset: Option<BankedReset>,
 {
     let Some(banked_reset) = banked_reset else { return codex };
     let mut quota = codex.unwrap_or_else(|| ToolQuota {
-        tool: "codex", plan: None, account: None, observed_at: now, windows: vec![], balances: vec![], banked_reset: None,
+        tool: "codex", plan: None, account: None, source: None, observed_at: now, windows: vec![], balances: vec![], banked_reset: None,
     });
     quota.banked_reset = Some(banked_reset);
     Some(quota)
@@ -562,6 +647,8 @@ struct Providers
 {
     #[serde(skip)]
     antigravity: Option<ToolQuota>,
+    #[cfg(windows)]
+    codex_usage: Value,
     codex_reset: Value,
     deepseek: Value,
 }
@@ -670,7 +757,7 @@ fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Opti
         (rank, window.minutes)
     });
     (!windows.is_empty()).then_some(ToolQuota {
-        tool: "antigravity", plan: None, account: None, observed_at, windows, balances: vec![], banked_reset: None,
+        tool: "antigravity", plan: None, account: None, source: None, observed_at, windows, balances: vec![], banked_reset: None,
     })
 }
 
@@ -682,9 +769,23 @@ fn deepseek_quota(data: &Value, observed_at: i64) -> Option<ToolQuota>
         amount.is_finite().then_some(Balance { currency, amount })
     }).collect();
     (!balances.is_empty()).then_some(ToolQuota {
-        tool: "dsh", plan: None, account: None, observed_at, windows: vec![], balances, banked_reset: None,
+        tool: "dsh", plan: None, account: None, source: None, observed_at, windows: vec![], balances, banked_reset: None,
     })
 }
+
+#[cfg(windows)]
+fn online_codex_quota(codex_auth: &Path, log: &AppLog) -> Result<ToolQuota, String>
+{
+    let providers: Providers = powershell_json(QUOTA_SCRIPT, &[
+        ("TOKEN_MONITOR_LITE_CODEX_AUTH", codex_auth.as_os_str()),
+        ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex_usage".as_ref()),
+    ], REMOTE_HELPER_TIMEOUT, log)?;
+    if let Some(reason) = providers.codex_usage["error"].as_str() { return Err(reason.into()); }
+    parse_online_codex(&providers.codex_usage, Utc::now().timestamp_millis()).ok_or_else(|| "no_usable_windows".into())
+}
+
+#[cfg(not(windows))]
+fn online_codex_quota(_: &Path, _: &AppLog) -> Result<ToolQuota, String> { Err("unsupported_platform".into()) }
 
 #[cfg(windows)]
 fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &AppLog) -> Providers
@@ -714,6 +815,7 @@ fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &AppLog) -> Provi
             antigravity: local.and_then(|worker| worker.join().expect("Antigravity quota reader")),
             codex_reset,
             deepseek: balance.map(|worker| worker.join().expect("DeepSeek quota reader")).unwrap_or_default(),
+            ..Providers::default()
         }
     })
 }
@@ -871,7 +973,7 @@ mod tests
             }}
         });
         fs::write(&rollout, format!("{event}\r\n")).unwrap();
-        cache.sample_local(&sources, tools, "startup");
+        cache.sample_startup(&sources, tools, Some(|| Err("no_usage_response".into())), &|| {});
         let snapshot = cache.read(&sources, settings, true);
         assert_eq!(snapshot.tools[0].observed_at, at);
         cache.record_banked_reset_panel(true, true, false, None, false, [Some(at), None]);
@@ -881,6 +983,8 @@ mod tests
         for expected in ["startup version=", "directory_errors=1 read_errors=0",
             "trigger=panel tool=codex source=session_logs result=no_reading",
             "trigger=startup tool=codex source=local_history result=read",
+            "trigger=startup tool=codex source=online result=failed reason=no_usage_response",
+            "trigger=startup tool=codex source=local_history result=fallback",
             "trigger=startup tool=codex result=first_reading", "\"remaining\":75.0",
             "trigger=panel tool=codex result=same_timestamp", "panel view=limits"]
         {
@@ -895,6 +999,43 @@ mod tests
         fs::remove_dir(sources.codex_root()).unwrap();
         fs::remove_dir(root.join("logs")).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_codex_publishes_online_windows_before_any_panel_refresh()
+    {
+        let cache = QuotaCache::default();
+        let sources = Sources::from_home(Some(PathBuf::new()));
+        let local_tools = ToolSelection { codex: false, antigravity: false, dsh: false };
+        let tools = ToolSelection { codex: true, ..local_tools };
+        let now = Utc::now().timestamp_millis();
+        let online = parse_online_codex(&json!({
+            "plan_type":"plus","rate_limit":{
+                "primary_window":{"limit_window_seconds":604800,"used_percent":25,"reset_at":1_800_000_000},
+                "secondary_window":{"limit_window_seconds":18000,"used_percent":100,"reset_at":1_799_500_000}
+            }
+        }), now).unwrap();
+        cache.sample_startup(&sources, local_tools, Some(|| Ok(online)), &|| {});
+
+        let cached = cache.cached(tools).unwrap();
+        assert_eq!(cached.checked_at, None);
+        let quota = &cached.tools[0];
+        assert_eq!(quota.source, Some("online"));
+        assert_eq!(quota.observed_at, now);
+        assert_eq!((quota.windows[0].minutes, quota.windows[0].remaining), (Some(300), 0.0));
+        assert_eq!((quota.windows[1].minutes, quota.windows[1].remaining), (Some(10_080), 75.0));
+        assert_eq!(quota.windows[1].resets_at, Some(1_800_000_000_000));
+        assert!(parse_online_codex(&json!({"rate_limit":null}), now).is_none());
+
+        let local = parse_codex(&json!({
+            "timestamp":now-1_000,"type":"event_msg","payload":{"type":"token_count",
+            "rate_limits":{"primary":{"window_minutes":10080,"used_percent":85}}}
+        }));
+        let panel = cache.refresh(QuotaSettings { tools, ..QuotaSettings::default() }, true,
+            || (local, Providers::default(), vec![]));
+        assert_eq!(panel.tools[0].source, Some("online"));
+        assert_eq!(panel.tools[0].windows.len(), 2);
     }
 
     #[test]

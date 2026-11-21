@@ -9,7 +9,7 @@ use std::{
 use serde_json::{json, Value};
 
 use crate::app_log::{AppLog, LOG_FILE};
-use super::{powershell_json, QUOTA_SCRIPT, REMOTE_HELPER_TIMEOUT};
+use super::{parse_online_codex, powershell_json, QUOTA_SCRIPT, REMOTE_HELPER_TIMEOUT};
 
 #[test]
 fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
@@ -38,6 +38,10 @@ fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
             }
             let body = match target
             {
+                "http://quota.invalid/usage" if authorized("Authorization: Bearer codex-fixture")
+                    && authorized("ChatGPT-Account-Id: quota-account-fixture") =>
+                    json!({"plan_type":"prolite","rate_limit":{"primary_window":{
+                        "used_percent":25,"limit_window_seconds":604800,"reset_at":1_800_000_000}}}),
                 "http://quota.invalid/resets" if authorized("Authorization: Bearer codex-fixture") =>
                     json!({"available_count":3, "credits":[]}),
                 "http://quota.invalid/balance" if authorized("Authorization: Bearer deepseek-fixture") =>
@@ -57,6 +61,7 @@ fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
     let log = AppLog::new(&root);
     fs::write(&auth, r#"{"tokens":{"access_token":"codex-fixture","account_id":"quota-account-fixture"}}"#).unwrap();
     let helper = QUOTA_SCRIPT
+        .replace("https://chatgpt.com/backend-api/wham/usage", "http://quota.invalid/usage")
         .replace("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", "http://quota.invalid/resets")
         .replace("https://api.deepseek.com/user/balance", "http://quota.invalid/balance");
     let probes = r#"
@@ -85,7 +90,7 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
         ("HTTP_PROXY", "http://127.0.0.1:1".as_ref()), ("HTTPS_PROXY", "http://127.0.0.1:1".as_ref()),
         ("ALL_PROXY", "http://127.0.0.1:1".as_ref()), ("NO_PROXY", "".as_ref()),
         ("QUOTA_TEST_ORIGIN", origin.as_ref()),
-        ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex,dsh".as_ref()),
+        ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex_usage,codex,dsh".as_ref()),
         ("TOKEN_MONITOR_LITE_CODEX_AUTH", auth.as_os_str()), ("DEEPSEEK_API_KEY", "deepseek-fixture".as_ref()),
     ], REMOTE_HELPER_TIMEOUT, &log);
     fs::remove_file(auth).unwrap();
@@ -98,6 +103,12 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
     fs::remove_dir(root).unwrap();
 
     let result = result.expect("quota helper JSON");
+    let quota = parse_online_codex(&result["providers"]["codex_usage"], 1_700_000_000_000).unwrap();
+    assert_eq!(quota.plan.as_deref(), Some("Pro 100"));
+    assert_eq!(quota.windows.len(), 1);
+    assert_eq!(quota.windows[0].minutes, Some(10_080));
+    assert_eq!(quota.windows[0].remaining, 75.0);
+    assert_eq!(requests.iter().filter(|line| line.starts_with("GET http://quota.invalid/usage ")).count(), 1);
     assert_eq!(result["providers"]["codex_reset"]["available_count"], 3);
     assert_eq!(result["providers"]["deepseek"]["balance_infos"][0]["total_balance"], "12.50");
     assert!(requests.iter().any(|line| line.starts_with("CONNECT quota.invalid:443 ")));
@@ -111,7 +122,8 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
     for expected in ["route source=proxy-server", "client=winhttp proxy_scheme=http proxy_loopback=True",
         "winhttp phase=send timeout_ms=20000", "winhttp phase=wait", "http status=200",
         "response count_field=available_count count=3", "route source=HTTP_PROXY",
-        "transport client=curl", "curl exit=0 http=200"]
+        "transport client=curl", "curl exit=0 http=200", "codex_usage trigger=startup route source=proxy-server",
+        "codex_usage trigger=startup http status=200"]
     {
         assert!(trace.contains(expected), "missing {expected} in {trace}");
     }
@@ -186,6 +198,9 @@ foreach ($script:body in '', '{private-malformed-body', '{"message":"private-rep
 {
     $null = Get-CodexBankedReset
 }
+$script:status = 403
+$usage = Get-CodexUsage
+if ($usage.error -ne 'no_usage_response') { throw 'Unexpected Codex usage result' }
 Write-Output 'true'
 "#;
     let script = format!(". {{\n{QUOTA_SCRIPT}\n}} | Out-Null\n{probes}");
@@ -204,7 +219,8 @@ Write-Output 'true'
         "auth result=ready account_header=True", "failure stage=request hresult=0x", "http status=401", "http status=403",
         "http status=429", "http status=503", "response result=empty_body", "failure stage=response_json",
         "count_field=missing count=unusable", "count_field=null count=unusable",
-        "count_field=available_count count=unusable", "count_field=availableCount count=0"]
+        "count_field=available_count count=unusable", "count_field=availableCount count=0",
+        "codex_usage trigger=startup http status=403"]
     {
         assert!(trace.contains(expected), "missing {expected} in {trace}");
     }

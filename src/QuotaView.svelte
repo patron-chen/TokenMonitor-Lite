@@ -93,7 +93,8 @@
   {
     if (provider.tool === 'antigravity') return 'RPC';
     if (provider.tool === 'dsh') return 'API';
-    return local('Local logs', '本地日志') + (provider.bankedReset ? ' · OAuth' : '');
+    const label = provider.source === 'online' ? local('Online quota', '在线额度') : local('Local records', '本地记录');
+    return label + (provider.bankedReset ? ' · OAuth' : '');
   }
 
   function windowMetric(provider: ToolQuota, window: QuotaWindow): Metric

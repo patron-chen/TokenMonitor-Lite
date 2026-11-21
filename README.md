@@ -35,9 +35,9 @@ Codex 和 Antigravity 的 5 小时、每周窗口在重置时间下显示预计�
 
 点击预测旁的「重置」，可让对应工具、模型组的单个窗口重新采样。本周期已用 Token、估价和额度历史均保留。从重置后的首次有效额度读数开始，累计有效扣减达到 5 个百分点即可重新显示预测。重启 Lite 后仍按这个起点计算。
 
-运行中的 Antigravity 提供实时额度和重置时间。Lite 优先读取分组额度，旧版服务可回退到模型额度。套餐名暂时读不到时仍显示有效额度，包括剩余 0% 的窗口。Codex 显示最近的本地额度记录，并从已登录账号读取 Banked Reset 的可用次数和到期时间。点 `i` 查看各次的到期明细。配置 `DEEPSEEK_API_KEY` 或 `DEEPSEEK_KEY` 后可显示 DeepSeek API 余额。重新打开主页或额度页时先显示托盘进程中的上次结果，同时读取最新额度。个别工具读取失败时保留其上次结果。
+运行中的 Antigravity 提供实时额度和重置时间。Lite 优先读取分组额度，旧版服务可回退到模型额度。套餐名暂时读不到时仍显示有效额度，包括剩余 0% 的窗口。启用 Codex 额度后，Lite 启动时用已登录账号查询一次 5 小时和每周额度。请求失败或响应没有可用窗口时，使用最近的本地记录。服务只返回一个窗口时，按其时长显示对应额度。之后用量变化或面板刷新会继续读取本地日志。Banked Reset 在面板刷新时单独读取，点 `i` 查看各次的到期明细。配置 `DEEPSEEK_API_KEY` 或 `DEEPSEEK_KEY` 后可显示 DeepSeek API 余额。重新打开主页或额度页时先显示托盘进程中的上次结果，同时读取最新额度。个别工具读取失败时保留其上次结果。
 
-Codex Banked Reset、DeepSeek 余额、Antigravity 本机 RPC 和构建时的 Tokscale 下载共用 HTTP 请求接口。回环地址和 `NO_PROXY` 匹配的域名或 IP 直连（逗号分隔，`*` 匹配全部）。其余请求优先使用 Lite 的 `--proxy-server` 启动参数，然后按目标协议读取 `HTTP_PROXY` 或 `HTTPS_PROXY`，其次使用 `ALL_PROXY`。构建时下载使用构建进程的代理环境。
+Codex 启动额度、Banked Reset、DeepSeek 余额、Antigravity 本机 RPC 和构建时的 Tokscale 下载共用 HTTP 请求接口。回环地址和 `NO_PROXY` 匹配的域名或 IP 直连（逗号分隔，`*` 匹配全部）。其余请求优先使用 Lite 的 `--proxy-server` 启动参数，然后按目标协议读取 `HTTP_PROXY` 或 `HTTPS_PROXY`，其次使用 `ALL_PROXY`。构建时下载使用构建进程的代理环境。
 
 Windows 快捷方式的「目标」可参照下例填写，将路径换成实际安装位置。更改参数后，从托盘退出 Lite，再用该快捷方式启动。
 
@@ -51,7 +51,7 @@ Lite 日志位于 `%LOCALAPPDATA%\TokenMonitorLite\logs\token-monitor-lite.log`�
 
 日志记录应用启动、正常退出、用量扫描失败和额度诊断。排查额度时可重新启动 Lite，再打开主页或额度页，点右下角刷新。
 
-- `quota startup` 记录启动采集是否排入计划及工具开关。
+- `quota startup` 记录启动采集是否排入计划及工具开关。`codex_usage` 记录启动在线请求的代理来源、HTTP 状态和失败阶段，`quota read` 记录实际读到的窗口或本地回退结果。
 - `quota read` 记录读取来源和结果，包括额度记录时间 `observed_at`、读到时的年龄 `age_ms`、窗口剩余百分比和重置时间。Codex 会记录扫描文件数量和读取错误，Antigravity 会区分未发现端点、RPC 失败和响应缺少有效额度。
 - `refresh` 记录面板检查是否命中缓存和等待时间。`quota publish` 记录后端采用的读数时间及是否变新，`panel` 记录面板采用的 Codex 和 Antigravity 读数时间。
 

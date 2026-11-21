@@ -128,16 +128,13 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
         let tools = schedule.take(now, interval);
         if startup
         {
-            let result = if tools.any() { "scheduled" } else { "no_enabled_tools" };
+            let codex_online = settings.quotas.tools.codex;
+            let result = if tools.any() || codex_online { "scheduled" } else { "no_enabled_tools" };
             cache.log.write(format_args!(
-                "quota startup result={result} codex_collection={} codex_quota={} antigravity_collection={} antigravity_quota={} refresh_minutes={} banked_reset=panel_only",
+                "quota startup result={result} codex_collection={} codex_quota={} antigravity_collection={} antigravity_quota={} refresh_minutes={} codex_online={codex_online} banked_reset=panel_only",
                 settings.collection.tools.codex, settings.quotas.tools.codex,
                 settings.collection.tools.antigravity, settings.quotas.tools.antigravity, settings.quotas.refresh_minutes));
-            if tools.any()
-            {
-                cache.sample_local(&sources, tools, "startup");
-                changed();
-            }
+            cache.sample_startup(&sources, tools, codex_online.then(|| || cache.fetch_startup_codex(&sources)), &changed);
             startup = false;
         }
         else if tools.any()

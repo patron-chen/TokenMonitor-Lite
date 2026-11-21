@@ -164,7 +164,7 @@ fn reset_persists_for_only_the_selected_tool_group_and_duration()
                     windows.push(w);
                 }
             }
-            ToolQuota { tool, plan: None, account: None, observed_at: now, windows, balances: vec![], banked_reset: None }
+            ToolQuota { tool, plan: None, account: None, source: None, observed_at: now, windows, balances: vec![], banked_reset: None }
         };
         let codex = provider("codex", &[""]);
         let ag = provider("antigravity", &["Gemini", "Claude/GPT"]);

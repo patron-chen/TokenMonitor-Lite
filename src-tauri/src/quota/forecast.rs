@@ -307,5 +307,5 @@ pub(super) fn sync(
     let windows = latest.into_iter().filter(|(_, r)| r.at == at).map(|(minutes, r)| QuotaWindow {
         group: String::new(), minutes: Some(minutes), remaining: r.value, resets_at: r.reset_at, forecast_reset_at: None, forecast: None,
     }).collect();
-    Ok(Some(ToolQuota { tool: "codex", plan, account: None, observed_at: at, windows, balances: vec![], banked_reset: None }))
+    Ok(Some(ToolQuota { tool: "codex", plan, account: None, source: None, observed_at: at, windows, balances: vec![], banked_reset: None }))
 }
