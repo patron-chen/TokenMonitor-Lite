@@ -15,6 +15,41 @@ function Read-Port([string]$Command, [string]$Name)
     return 0
 }
 
+function Read-SessionCsrfToken
+{
+    $roots = @(
+        (Join-Path $env:APPDATA 'antigravity\Local Storage\leveldb'),
+        (Join-Path $env:APPDATA 'antigravity-ide\Local Storage\leveldb')
+    )
+    foreach ($dir in $roots)
+    {
+        if (!(Test-Path -LiteralPath $dir)) { continue }
+        $files = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.log' -ErrorAction SilentlyContinue) +
+                 @(Get-ChildItem -LiteralPath $dir -File -Filter '*.ldb' -ErrorAction SilentlyContinue) |
+                 Sort-Object LastWriteTime -Descending
+        foreach ($file in $files)
+        {
+            try
+            {
+                # 以共享读写方式打开，避免与运行中的客户端进程冲突
+                $fs = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $bytes = [byte[]]::new($fs.Length)
+                $fs.Read($bytes, 0, $fs.Length) | Out-Null
+                $fs.Close()
+                $text = [System.Text.Encoding]::GetEncoding('iso-8859-1').GetString($bytes)
+                $matches = [regex]::Matches($text, 'agy_session_csrf_token[^\r\n]{0,20}?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+                if ($matches.Count -gt 0)
+                {
+                    # 匹配最新写入的 session token
+                    return $matches[$matches.Count - 1].Groups[1].Value
+                }
+            }
+            catch {}
+        }
+    }
+    return ''
+}
+
 function Get-AntigravityEndpoints
 {
     $filter = "Name LIKE 'language[_]server%' OR Name LIKE 'language-server%' OR Name LIKE 'agy%' OR Name LIKE 'antigravity-cli%'"
@@ -29,7 +64,17 @@ function Get-AntigravityEndpoints
             ($process.Name -match '^(?:agy|antigravity-cli)(?:\.exe)?$' -and ($hub -or $line -match '\slanguage[_-]server(?:\s|$)'))
         if (!$app -and !$cli) { continue }
         $csrf = Read-Flag $line 'csrf_token'
-        if (!$csrf -and ($app -or $hub)) { continue }
+        if (!$csrf -and $app)
+        {
+            # 兼容 Antigravity 2.34.0+：桌面端不再通过命令行传递 --csrf_token，尝试从本地 Session Storage 中读取
+            $csrf = Read-SessionCsrfToken
+        }
+        # hub 模式缺少 token 时予以跳过；未能获取到 token 的 app 或普通 cli 则兼容保留为空字符串供免鉴权探测
+        if (!$csrf -and $hub) { continue }
+        if (!$csrf)
+        {
+            $csrf = ''
+        }
         $ide = $appDir -eq 'antigravity-ide' -or $line -match '[/\\]extensions[/\\]antigravity[/\\]bin[/\\]language[_-]server'
         [pscustomobject]@{
             rank = if ($app -and $ide) { 2 } elseif ($app) { 0 } else { 1 }
@@ -62,6 +107,7 @@ function Get-AntigravityEndpoints
         {
             foreach ($secure in @($true, $false))
             {
+                # 兼容能获取到 csrf_token（携带 token）和不能获取到（csrf 为空字符串）的两种情况
                 @{ rank = $service.rank; secure = $secure; port = $port; csrf = $service.csrf }
             }
         }
