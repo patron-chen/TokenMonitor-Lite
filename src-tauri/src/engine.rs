@@ -14,6 +14,7 @@ use notify::{event::{CreateKind, ModifyKind, RemoveKind, RenameMode}, Event, Eve
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
+    app_log::AppLog,
     cache::{Cache, Report}, model::{next_midnight, system_zone, Activity, DailyUsage, Period, SessionPage, Span, Summary, PAGE_SIZE},
     pricing::Pricing,
     quota::sampler::UsageSignal,
@@ -84,7 +85,7 @@ pub struct Engine
 impl Engine
 {
     pub fn start(
-        root: &Path, scanner: PathBuf, preferences: Arc<PreferencesStore>, samples: UsageSignal,
+        root: &Path, scanner: PathBuf, preferences: Arc<PreferencesStore>, samples: UsageSignal, log: Arc<AppLog>,
         changed: impl Fn(Period, u64, Option<Summary>) + Send + 'static,
     ) -> Result<Self, Box<dyn std::error::Error>>
     {
@@ -102,7 +103,7 @@ impl Engine
             cache: cache.clone(), sources: sources.clone(), config, scanner,
             preferences: preferences.clone(), watching: watching.clone(),
             signals: signals.clone(), receiver, progress: progress.clone(), stopped: stopped.clone(), changed,
-            tray: tray.clone(), samples,
+            tray: tray.clone(), samples, log,
         };
         let worker = thread::Builder::new().name("usage-scan".into()).spawn(move || worker.run())?;
         let engine = Self { cache, sources, preferences, signals, tray, progress, watching, stopped, worker: Mutex::new(Some(worker)) };
@@ -268,6 +269,7 @@ fn first_weekday() -> Weekday { Weekday::Mon }
 
 struct Worker<F>
 {
+    log: Arc<AppLog>,
     cache: Cache,
     sources: Sources,
     config: PathBuf,
@@ -373,7 +375,11 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
                 revision += 1;
                 self.publish(period, revision);
                 let result = self.scan(period, settings.tools);
-                if period == Period::Today && result.is_err() { work.invalidated = true; }
+                if let Err(error) = &result
+                {
+                    self.log.write(format_args!("usage scan period={period:?} result=failed error={error}"));
+                    if period == Period::Today { work.invalidated = true; }
+                }
                 {
                     let mut progress = self.progress.lock().expect("scan progress");
                     *progress.entry(period).or_default() = Progress { running: false, failure: result.err() };

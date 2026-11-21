@@ -1,16 +1,17 @@
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
+    app_log::{timestamp, AppLog},
     quota_history::{HistoryPreview, QuotaHistory, QuotaKey, Reading, Sample, RETENTION_MS},
     settings::{QuotaSettings, ToolSelection},
     sources::Sources,
@@ -18,10 +19,8 @@ use crate::{
 
 #[cfg(windows)]
 mod antigravity;
-mod banked_log;
 mod forecast;
 pub(crate) mod sampler;
-use banked_log::BankedResetLog;
 
 #[cfg(all(windows, test))]
 mod proxy_tests;
@@ -87,21 +86,42 @@ struct BankedReset
     expirations: Vec<i64>,
 }
 
+impl AppLog
+{
+    fn reading(&self, trigger: &str, tool: &str, source: &str, result: &str, quota: Option<&ToolQuota>)
+    {
+        if let Some(quota) = quota
+        {
+            // Log only the values used by the panel. A provider row can contain account metadata.
+            let windows = Value::Array(quota.windows.iter().map(|window| json!({
+                "minutes": window.minutes, "remaining": window.remaining, "resets_at": timestamp(window.resets_at),
+            })).collect());
+            let now = Utc::now().timestamp_millis();
+            self.write(format_args!("quota read trigger={trigger} tool={tool} source={source} result={result} observed_at={} age_ms={} windows={}",
+                timestamp(Some(quota.observed_at)), now.saturating_sub(quota.observed_at), windows));
+        }
+        else
+        {
+            self.write(format_args!("quota read trigger={trigger} tool={tool} source={source} result={result}"));
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct QuotaCache
 {
     snapshot: Mutex<Quotas>,
     refreshed: Mutex<Option<(Instant, ToolSelection)>>,
     history: Option<QuotaHistory>,
-    banked_log: BankedResetLog,
+    log: Arc<AppLog>,
     stopping: AtomicBool,
 }
 
 impl QuotaCache
 {
-    pub fn new(root: &Path) -> Self
+    pub fn new(root: &Path, log: Arc<AppLog>) -> Self
     {
-        Self { history: Some(QuotaHistory::new(root)), banked_log: BankedResetLog::new(root), ..Self::default() }
+        Self { history: Some(QuotaHistory::new(root)), log, ..Self::default() }
     }
 
     pub fn cached(&self, tools: ToolSelection) -> Option<Quotas>
@@ -113,7 +133,11 @@ impl QuotaCache
     pub fn read(&self, sources: &Sources, settings: QuotaSettings, force: bool) -> Quotas
     {
         let tools = settings.tools;
-        if !tools.any() { return Quotas::default(); }
+        if !tools.any()
+        {
+            self.log.write(format_args!("quota refresh trigger=panel result=no_enabled_tools"));
+            return Quotas::default();
+        }
         self.refresh(settings, force, || std::thread::scope(|scope| {
             let codex = tools.codex.then(|| scope.spawn(|| {
                 let cutoff = self.history.as_ref().map(|_| {
@@ -121,15 +145,15 @@ impl QuotaCache
                         .find(|quota| quota.tool == "codex" && !quota.windows.is_empty())
                         .map_or_else(|| Utc::now().timestamp_millis() - RETENTION_MS, |quota| quota.observed_at)
                 });
-                codex_quota(&sources.codex_sessions(), cutoff)
+                codex_quota(&sources.codex_sessions(), cutoff, &self.log, "panel")
             }));
             let providers = if sources.home_override.is_none()
             {
-                windows_quota(&sources.codex_auth(), tools, &self.banked_log)
+                windows_quota(&sources.codex_auth(), tools, &self.log)
             }
             else
             {
-                if tools.codex { self.banked_log.write(format_args!("request skipped=source_home_override")); }
+                self.log.write(format_args!("quota refresh trigger=panel live_requests=skipped reason=source_home_override"));
                 Providers::default()
             };
             let (codex, history) = codex.map(|reader| reader.join().expect("Codex quota reader")).unwrap_or_default();
@@ -167,29 +191,65 @@ impl QuotaCache
         Ok(snapshot.for_tools(tools))
     }
 
-    fn sample_local(&self, sources: &Sources, tools: ToolSelection)
+    fn sample_local(&self, sources: &Sources, tools: ToolSelection, trigger: &str)
     {
-        let Some(history) = &self.history else { return };
+        let start = Instant::now();
+        self.log.write(format_args!("quota sample trigger={trigger} result=started codex={} antigravity={}",
+            tools.codex, tools.antigravity));
+        let Some(history) = &self.history else {
+            self.log.write(format_args!("quota sample trigger={trigger} result=skipped reason=no_history_store"));
+            return;
+        };
         let mut updates = Vec::new();
         // Take the RPC snapshot first so the usage scan covers its observation time.
         #[cfg(windows)]
-        if tools.antigravity && sources.home_override.is_none()
+        if tools.antigravity
         {
-            if let Some(row) = antigravity::read() { updates.push(row); }
+            if sources.home_override.is_some()
+            {
+                self.log.write(format_args!("quota read trigger={trigger} tool=antigravity source=local_rpc result=skipped reason=source_home_override"));
+            }
+            else
+            {
+                if let Some(row) = antigravity::read(&self.log, trigger)
+                {
+                    updates.push(row);
+                }
+            }
         }
         let now = Utc::now().timestamp_millis();
         for tool in tools.enabled()
         {
+            if tool == "codex"
+            {
+                self.log.reading(trigger, tool, "local_history", "started", None);
+            }
             match forecast::sync(history, sources, tool, now, &self.stopping)
             {
-                Ok(Some(row)) => updates.push(row),
+                Ok(Some(row)) =>
+                {
+                    self.log.reading(trigger, tool, "local_history", "read", Some(&row));
+                    updates.push(row);
+                }
+                Ok(None) if tool == "codex" => self.log.reading(trigger, tool, "local_history", "no_reading", None),
                 Ok(None) => (),
-                Err(error) => eprintln!("Could not index {tool} quota usage: {error}"),
+                Err(error) =>
+                {
+                    self.log.reading(trigger, tool, "local_history", "index_failed", None);
+                    eprintln!("Could not index {tool} quota usage: {error}");
+                }
             }
         }
+        self.publish_samples(tools, trigger, updates, start);
+    }
+
+    fn publish_samples(&self, tools: ToolSelection, trigger: &str, updates: Vec<ToolQuota>, start: Instant)
+    {
         // Serialize publication with foreground refreshes, keeping the full refresh TTL independent.
         let _refresh = self.refreshed.lock().expect("quota refresh");
+        let now = Utc::now().timestamp_millis();
         let mut snapshot = self.snapshot.lock().expect("quota snapshot").clone();
+        let previous = snapshot.observation_times();
         let mut samples = Vec::new();
         for mut row in updates
         {
@@ -202,17 +262,50 @@ impl QuotaCache
             }
             else { snapshot.tools.push(row); }
         }
-        if history.record(&samples, now).is_err() { eprintln!("Could not save background quota observations."); }
-        forecast::attach(history, &mut snapshot.tools, tools, now);
+        if let Some(history) = &self.history
+        {
+            if history.record(&samples, now).is_err()
+            {
+                self.log.write(format_args!("quota history trigger={trigger} result=write_failed"));
+                eprintln!("Could not save background quota observations.");
+            }
+            forecast::attach(history, &mut snapshot.tools, tools, now);
+        }
         snapshot.observed_at = snapshot.observed_at.max(Utc::now().timestamp_millis());
+        let current = snapshot.observation_times();
         *self.snapshot.lock().expect("quota snapshot") = snapshot;
+        self.log_publication(trigger, tools, previous, current, start.elapsed());
     }
 
-    pub fn record_banked_reset_panel(&self, limits_view: bool, codex_enabled: bool, read_failed: bool, count: Option<u64>, rendered: bool)
+    fn log_publication(
+        &self, trigger: &str, tools: ToolSelection, previous: [Option<i64>; 3], current: [Option<i64>; 3], elapsed: Duration,
+    )
+    {
+        for ((tool, previous), current) in ToolSelection::IDS.into_iter().zip(previous).zip(current)
+        {
+            if !tools.contains(tool) { continue; }
+            let result = match (previous, current)
+            {
+                (_, None) => "unavailable",
+                (None, Some(_)) => "first_reading",
+                (Some(old), Some(new)) if new > old => "newer_reading",
+                (Some(old), Some(new)) if new < old => "older_timestamp",
+                _ => "same_timestamp",
+            };
+            self.log.write(format_args!("quota publish trigger={trigger} tool={tool} result={result} observed_at={} previous_at={} elapsed_ms={}",
+                timestamp(current), timestamp(previous), elapsed.as_millis()));
+        }
+    }
+
+    pub fn record_banked_reset_panel(
+        &self, limits_view: bool, codex_enabled: bool, read_failed: bool, count: Option<u64>, rendered: bool, observed_at: [Option<i64>; 2],
+    )
     {
         let view = if limits_view { "limits" } else { "home" };
         let count = count.map_or_else(|| "unavailable".into(), |value| value.to_string());
-        self.banked_log.write(format_args!("panel view={view} codex_enabled={codex_enabled} read_failed={read_failed} count={count} rendered={rendered}"));
+        let [codex, antigravity] = observed_at;
+        self.log.write(format_args!("panel view={view} codex_enabled={codex_enabled} read_failed={read_failed} count={count} rendered={rendered} codex_observed_at={} antigravity_observed_at={}",
+            timestamp(codex), timestamp(antigravity)));
     }
 
     fn refresh(
@@ -221,33 +314,42 @@ impl QuotaCache
     ) -> Quotas
     {
         // Opening a WebView can read the last snapshot while I/O is in flight.
+        let queued = Instant::now();
         let mut refreshed = self.refreshed.lock().expect("quota refresh");
         let ttl = Duration::from_secs(u64::from(settings.refresh_minutes) * 60);
-        self.banked_log.begin(format_args!("refresh force={force} codex_enabled={}", settings.tools.codex));
+        let tools = settings.tools;
+        self.log.write(format_args!("refresh force={force} codex_enabled={} trigger=panel antigravity_enabled={} dsh_enabled={} queue_ms={}",
+            tools.codex, tools.antigravity, tools.dsh, queued.elapsed().as_millis()));
         if !force && refreshed.is_some_and(|(at, tools)| tools == settings.tools && at.elapsed() < ttl)
         {
-            self.banked_log.write(format_args!("refresh result=cache_hit"));
+            self.log.write(format_args!("refresh result=cache_hit"));
             return self.cached(settings.tools).unwrap_or_default();
         }
         let start = Instant::now();
         let (codex, providers, mut samples) = collect();
         let observed_at = Utc::now().timestamp_millis();
         let mut snapshot = self.snapshot.lock().expect("quota snapshot").clone();
+        let previous = snapshot.observation_times();
         let bank_source = snapshot.merge(codex, providers, observed_at, &mut samples);
         if let Some(history) = &self.history
         {
-            if history.record(&samples, observed_at).is_err() { eprintln!("Could not save the local quota history."); }
+            if history.record(&samples, observed_at).is_err()
+            {
+                self.log.write(format_args!("quota history trigger=panel result=write_failed"));
+                eprintln!("Could not save the local quota history.");
+            }
             forecast::attach(history, &mut snapshot.tools, settings.tools, observed_at);
         }
         *refreshed = Some((Instant::now(), settings.tools));
         let result = snapshot.for_tools(settings.tools);
         *self.snapshot.lock().expect("quota snapshot") = snapshot;
+        self.log_publication("panel", tools, previous, result.observation_times(), start.elapsed());
         if settings.tools.codex
         {
             let bank = result.tools.iter().find(|row| row.tool == "codex").and_then(|row| row.banked_reset.as_ref());
             let count = bank.map_or_else(|| "unavailable".into(), |bank| bank.available_count.to_string());
             let expirations = bank.map_or(0, |bank| bank.expirations.len());
-            self.banked_log.write(format_args!("quota source={bank_source} count={count} future_expirations={expirations} elapsed_ms={}", start.elapsed().as_millis()));
+            self.log.write(format_args!("quota source={bank_source} count={count} future_expirations={expirations} elapsed_ms={}", start.elapsed().as_millis()));
         }
         result
     }
@@ -255,6 +357,13 @@ impl QuotaCache
 
 impl Quotas
 {
+    fn observation_times(&self) -> [Option<i64>; 3]
+    {
+        ToolSelection::IDS.map(|tool| self.tools.iter()
+            .find(|row| row.tool == tool && (!row.windows.is_empty() || !row.balances.is_empty()))
+            .map(|row| row.observed_at))
+    }
+
     fn for_tools(&self, tools: ToolSelection) -> Self
     {
         let mut result = self.clone();
@@ -308,15 +417,24 @@ impl ToolQuota
     }
 }
 
-fn rollout_candidates(path: &Path, depth: u8, files: &mut Vec<(SystemTime, PathBuf)>)
+fn rollout_candidates(path: &Path, depth: u8, files: &mut Vec<(SystemTime, PathBuf)>, errors: &mut usize)
 {
-    for entry in fs::read_dir(path).into_iter().flatten().filter_map(Result::ok)
+    let entries = match fs::read_dir(path)
+    {
+        Ok(entries) => entries,
+        Err(_) =>
+        {
+            *errors += 1;
+            return;
+        }
+    };
+    for entry in entries.filter_map(Result::ok)
     {
         let file = entry.path();
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() && depth > 0
         {
-            rollout_candidates(&file, depth - 1, files);
+            rollout_candidates(&file, depth - 1, files, errors);
         }
         else if kind.is_file() && file.extension().is_some_and(|ext| ext == "jsonl")
             && entry.file_name().to_string_lossy().starts_with("rollout-")
@@ -326,15 +444,20 @@ fn rollout_candidates(path: &Path, depth: u8, files: &mut Vec<(SystemTime, PathB
     }
 }
 
-fn codex_quota(root: &Path, history_after: Option<i64>) -> (Option<ToolQuota>, Vec<Sample>)
+fn codex_quota(root: &Path, history_after: Option<i64>, log: &AppLog, trigger: &str) -> (Option<ToolQuota>, Vec<Sample>)
 {
+    let start = Instant::now();
+    log.reading(trigger, "codex", "session_logs", "started", None);
     let mut files = Vec::new();
-    rollout_candidates(root, 3, &mut files);
+    let mut directory_errors = 0;
+    rollout_candidates(root, 3, &mut files, &mut directory_errors);
     files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     let mut history = Vec::new();
-    let latest = files.iter().take(8).filter_map(|(_, path)| {
+    let mut read_errors = 0;
+    let files_checked = files.len().min(8);
+    let latest = files.iter().take(files_checked).filter_map(|(_, path)| {
         let mut minute = None;
-        read_codex_tail(path, |quota| {
+        let result = read_codex_tail(path, |quota| {
             let bucket = quota.observed_at / 60_000;
             // Recover samples written between refreshes from the existing bounded log reads.
             if history_after.is_some_and(|after| quota.observed_at > after)
@@ -343,27 +466,33 @@ fn codex_quota(root: &Path, history_after: Option<i64>) -> (Option<ToolQuota>, V
                 quota.samples(&mut history);
                 minute = Some(bucket);
             }
-        })
+        });
+        if result.is_err() { read_errors += 1; }
+        result.ok().flatten()
     }).max_by_key(|row| row.observed_at);
+    log.write(format_args!("quota scan trigger={trigger} tool=codex files_found={} files_checked={files_checked} directory_errors={directory_errors} read_errors={read_errors} elapsed_ms={}",
+        files.len(), start.elapsed().as_millis()));
+    let status = if latest.is_some() { "read" } else { "no_reading" };
+    log.reading(trigger, "codex", "session_logs", status, latest.as_ref());
     (latest, history)
 }
 
-fn read_codex_tail(path: &Path, mut observe: impl FnMut(&ToolQuota)) -> Option<ToolQuota>
+fn read_codex_tail(path: &Path, mut observe: impl FnMut(&ToolQuota)) -> io::Result<Option<ToolQuota>>
 {
-    let file = File::open(path).ok()?;
-    let start = file.metadata().ok()?.len().saturating_sub(CODEX_TAIL_BYTES);
+    let file = File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(CODEX_TAIL_BYTES);
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     if start > 0
     {
-        reader.seek(SeekFrom::Start(start - 1)).ok()?;
-        reader.read_until(b'\n', &mut line).ok()?;
+        reader.seek(SeekFrom::Start(start - 1))?;
+        reader.read_until(b'\n', &mut line)?;
     }
     let mut latest = None;
     loop
     {
         line.clear();
-        if reader.read_until(b'\n', &mut line).ok()? == 0 { break; }
+        if reader.read_until(b'\n', &mut line)? == 0 { break; }
         if !line.windows(b"\"rate_limits\"".len()).any(|part| part == b"\"rate_limits\"") { continue; }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else { continue };
         if let Some(quota) = parse_codex(&value)
@@ -372,7 +501,7 @@ fn read_codex_tail(path: &Path, mut observe: impl FnMut(&ToolQuota)) -> Option<T
             latest = Some(quota);
         }
     }
-    latest
+    Ok(latest)
 }
 
 fn parse_codex(value: &Value) -> Option<ToolQuota>
@@ -558,24 +687,26 @@ fn deepseek_quota(data: &Value, observed_at: i64) -> Option<ToolQuota>
 }
 
 #[cfg(windows)]
-fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &BankedResetLog) -> Providers
+fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &AppLog) -> Providers
 {
     std::thread::scope(|scope| {
         let remote = |tool: &str| -> Providers {
-            let log_path = log.path.as_deref().filter(|_| tool == "codex").map(Path::as_os_str).unwrap_or_default();
             powershell_json(QUOTA_SCRIPT, &[
                 ("TOKEN_MONITOR_LITE_CODEX_AUTH", codex_auth.as_os_str()),
                 ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", tool.as_ref()),
-                ("TOKEN_MONITOR_LITE_BANKED_LOG", log_path),
-            ], REMOTE_HELPER_TIMEOUT).unwrap_or_else(|reason| {
-                if tool == "codex" { log.write(format_args!("helper failure={reason}")); }
+            ], REMOTE_HELPER_TIMEOUT, log).unwrap_or_else(|reason| {
+                log.write(format_args!("quota helper tool={tool} failure={reason}"));
                 eprintln!("Windows {tool} quota helper failed: {reason}");
                 Providers::default()
             })
         };
-        let local = tools.antigravity.then(|| scope.spawn(antigravity::read));
+        let local = tools.antigravity.then(|| scope.spawn(|| antigravity::read(log, "panel")));
         let read_balance = tools.dsh && ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"].iter()
             .any(|name| std::env::var_os(name).is_some_and(|key| !key.is_empty()));
+        if tools.dsh && !read_balance
+        {
+            log.write(format_args!("quota read trigger=panel tool=dsh source=api result=skipped reason=no_api_key"));
+        }
         // A slow balance request must not consume the reset request's deadline or discard its result.
         let balance = read_balance.then(|| scope.spawn(move || remote("dsh").deepseek));
         let codex_reset = if tools.codex { remote("codex").codex_reset } else { Value::Null };
@@ -589,14 +720,25 @@ fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &BankedResetLog) 
 
 #[cfg(windows)]
 fn powershell_json<T: serde::de::DeserializeOwned + Send>(
-    script: &str, vars: &[(&str, &std::ffi::OsStr)], timeout: Duration,
+    script: &str, vars: &[(&str, &std::ffi::OsStr)], timeout: Duration, log: &AppLog,
 ) -> Result<T, String>
 {
     use std::{process::Stdio, thread};
-    let mut child = crate::network::start_powershell(script, vars, Stdio::null()).ok_or("spawn_failed")?;
+    let mut child = crate::network::start_powershell(script, vars, Stdio::null(), Stdio::piped()).ok_or("spawn_failed")?;
     let stdout = child.stdout.take().expect("piped quota response");
+    let stderr = child.stderr.take().expect("piped quota diagnostics");
     thread::scope(|scope| {
         let reader = scope.spawn(move || serde_json::from_reader(BufReader::new(stdout)));
+        scope.spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok)
+            {
+                // Untagged PowerShell errors can contain paths or script text.
+                if let Some(message) = line.strip_prefix("lite-log ")
+                {
+                    log.write(format_args!("{message}"));
+                }
+            }
+        });
         let deadline = Instant::now() + timeout;
         loop
         {
@@ -627,11 +769,12 @@ fn powershell_json<T: serde::de::DeserializeOwned + Send>(
 }
 
 #[cfg(not(windows))]
-fn windows_quota(_: &Path, _: ToolSelection, _: &BankedResetLog) -> Providers { Providers::default() }
+fn windows_quota(_: &Path, _: ToolSelection, _: &AppLog) -> Providers { Providers::default() }
 
 #[cfg(test)]
 mod tests
 {
+    use crate::app_log::LOG_FILE;
     use super::*;
     use serde_json::json;
 
@@ -657,17 +800,17 @@ mod tests
     #[test]
     fn cached_limits_are_readable_during_refresh_and_preserve_failed_sources()
     {
-        let log = std::env::temp_dir().join(format!("token-monitor-banked-cache-{}.log", std::process::id()));
-        fs::write(&log, vec![b'x'; 128 * 1024]).unwrap();
-        let cache = QuotaCache { banked_log: BankedResetLog { path: Some(log.clone()) }, ..QuotaCache::default() };
+        let root = std::env::temp_dir().join(format!("token-monitor-banked-cache-{}", std::process::id()));
+        let log = root.join("logs").join(LOG_FILE);
+        let cache = QuotaCache { log: Arc::new(AppLog::new(&root)), ..QuotaCache::default() };
         let settings = QuotaSettings::default();
         assert!(cache.cached(settings.tools).is_none());
-        let codex = |used| parse_codex(&json!({
-            "type":"event_msg","timestamp":"2026-11-20T00:00:00Z","payload":{"type":"token_count",
+        let codex = |used, timestamp| parse_codex(&json!({
+            "type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count",
                 "rate_limits":{"primary":{"used_percent":used,"window_minutes":10080}}
             }
         }));
-        cache.refresh(settings, true, || (codex(25), Providers {
+        cache.refresh(settings, true, || (codex(25, "2026-11-20T00:00:00Z"), Providers {
             codex_reset: json!({"available_count":2}),
             deepseek: json!({"balance_infos":[{"currency":"USD","total_balance":"5"}]}),
             ..Providers::default()
@@ -675,7 +818,7 @@ mod tests
         let refreshed = cache.refresh(settings, true, || {
             assert!(cache.snapshot.try_lock().is_ok());
             assert_eq!(cache.cached(settings.tools).unwrap().tools[0].windows[0].remaining, 75.0);
-            (codex(30), Providers::default(), vec![])
+            (codex(30, "2026-11-20T00:01:00Z"), Providers::default(), vec![])
         });
         assert_eq!(refreshed.tools[0].windows[0].remaining, 70.0);
         assert_eq!(refreshed.tools[0].banked_reset.as_ref().unwrap().available_count, 2);
@@ -694,12 +837,64 @@ mod tests
         assert_eq!(cache.refresh(without_codex, false, || panic!("fresh selection was rescanned")).tools.len(), 1);
         let trace = fs::read_to_string(&log).unwrap();
         fs::remove_file(log).unwrap();
-        assert!(!trace.contains("xxxx"));
+        fs::remove_dir(root.join("logs")).unwrap();
+        fs::remove_dir(root).unwrap();
         for expected in ["source=response count=2", "source=previous count=2", "source=response count=0",
-            "codex_enabled=false", "result=cache_hit"]
+            "codex_enabled=false", "result=cache_hit",
+            "trigger=panel tool=codex result=first_reading observed_at=2026-11-20T00:00:00.000Z",
+            "trigger=panel tool=codex result=newer_reading observed_at=2026-11-20T00:01:00.000Z",
+            "trigger=panel tool=codex result=same_timestamp observed_at=2026-11-20T00:01:00.000Z"]
         {
             assert!(trace.contains(expected));
         }
+    }
+
+    #[test]
+    fn codex_logging_distinguishes_missing_logs_and_old_observations()
+    {
+        let root = std::env::temp_dir().join(format!("token-monitor-quota-log-{}", std::process::id()));
+        let sources = Sources::from_home(Some(root.clone()));
+        let sessions = sources.codex_sessions();
+        let cache = QuotaCache::new(&root, Arc::new(AppLog::new(&root)));
+        let tools = ToolSelection { codex: true, antigravity: false, dsh: false };
+        let settings = QuotaSettings { tools, ..QuotaSettings::default() };
+        assert!(cache.read(&sources, settings, true).tools.is_empty());
+
+        let at = Utc::now().timestamp_millis() - 3_600_000;
+        let resets_at = at + 7 * 24 * 3_600_000;
+        fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("rollout-quota-log.jsonl");
+        let event = json!({
+            "type":"event_msg", "timestamp":at, "payload":{"type":"token_count","rate_limits":{
+                "limit_id":"codex", "account_id":"quota-test-account",
+                "primary":{"window_minutes":10080,"used_percent":25,"resets_at":resets_at}
+            }}
+        });
+        fs::write(&rollout, format!("{event}\r\n")).unwrap();
+        cache.sample_local(&sources, tools, "startup");
+        let snapshot = cache.read(&sources, settings, true);
+        assert_eq!(snapshot.tools[0].observed_at, at);
+        cache.record_banked_reset_panel(true, true, false, None, false, [Some(at), None]);
+
+        let log = root.join("logs").join(LOG_FILE);
+        let trace = fs::read_to_string(&log).unwrap();
+        for expected in ["startup version=", "directory_errors=1 read_errors=0",
+            "trigger=panel tool=codex source=session_logs result=no_reading",
+            "trigger=startup tool=codex source=local_history result=read",
+            "trigger=startup tool=codex result=first_reading", "\"remaining\":75.0",
+            "trigger=panel tool=codex result=same_timestamp", "panel view=limits"]
+        {
+            assert!(trace.contains(expected), "{expected:?} missing from {trace}");
+        }
+        assert!(trace.contains(&format!("codex_observed_at={}", timestamp(Some(at)))));
+        assert!(!trace.contains("quota-test-account"));
+        fs::remove_file(rollout).unwrap();
+        fs::remove_file(log).unwrap();
+        fs::remove_file(root.join("quota-history.sqlite")).unwrap();
+        fs::remove_dir(sessions).unwrap();
+        fs::remove_dir(sources.codex_root()).unwrap();
+        fs::remove_dir(root.join("logs")).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

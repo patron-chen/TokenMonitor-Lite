@@ -47,7 +47,15 @@ Windows 快捷方式的「目标」可参照下例填写，将路径换成实际
 
 启动参数和环境变量均未配置代理时，先读取当前 Windows 用户的代理设置（含 PAC），再回落到 WinHTTP 默认配置。HTTP 代理由 WinHTTP 使用，HTTPS、SOCKS5 或带凭据的代理使用系统 `curl.exe`。`socks5h://` 由代理解析域名。`socks5://` 使用本机 DNS，连接失败且未收到 HTTP 响应时，再用同一代理解析。
 
-排查 Codex Banked Reset 时，打开主页或额度页，点右下角刷新。等待额度读取结束后，可分享 `%LOCALAPPDATA%\TokenMonitorLite\logs\codex-banked-reset.log`。设置了 `TOKEN_MONITOR_LITE_DATA_DIR` 时，日志在该目录的 `logs` 下。日志自动记录账号凭据读取结果、代理来源与传输方式、HTTP 状态或错误码、可用次数、缓存来源和面板是否生成对应行。日志使用 UTC 时间，达到 128 KiB 后会在下次额度读取或启动时重新开始。令牌、账号 ID、代理地址及凭据、原始响应均不写入日志。
+Lite 日志位于 `%LOCALAPPDATA%\TokenMonitorLite\logs\token-monitor-lite.log`。设置了 `TOKEN_MONITOR_LITE_DATA_DIR` 时，日志在该目录的 `logs` 下。日志使用 UTC，启动时接着写。文件超过 10 MiB（10,485,760 字节）后，下次写入前将原文件归档到同目录，例如 `token-monitor-lite-20261121-113104-252763900Z.log`，再写入新的 `token-monitor-lite.log`。
+
+日志记录应用启动、正常退出、用量扫描失败和额度诊断。排查额度时可重新启动 Lite，再打开主页或额度页，点右下角刷新。
+
+- `quota startup` 记录启动采集是否排入计划及工具开关。
+- `quota read` 记录读取来源和结果，包括额度记录时间 `observed_at`、读到时的年龄 `age_ms`、窗口剩余百分比和重置时间。Codex 会记录扫描文件数量和读取错误，Antigravity 会区分未发现端点、RPC 失败和响应缺少有效额度。
+- `refresh` 记录面板检查是否命中缓存和等待时间。`quota publish` 记录后端采用的读数时间及是否变新，`panel` 记录面板采用的 Codex 和 Antigravity 读数时间。
+
+Banked Reset 原有的 HTTP 状态、可用次数和缓存来源继续记录。日志仅记录诊断所需字段，省略令牌、账号 ID、代理地址及凭据和原始响应。
 
 Codex 和 DeepSeek 的外网额度请求分别等待最多约 20 秒，并为 PowerShell 启动单独预留时间。两个工具同时启用时会并行读取，一方超时仍保留另一方已返回的额度。
 

@@ -246,8 +246,9 @@ export const backend = {
   summary: (period: Period) => invoke<Summary>('get_summary', { period }),
   activity: (force: boolean) => invoke<Activity>('get_activity', { force }),
   quotas: (force: boolean) => invoke<Quotas>('get_quotas', { force }),
-  bankedResetPanel: (limitsView: boolean, codexEnabled: boolean, readFailed: boolean, count: number | null, rendered: boolean) =>
-    invoke<void>('record_banked_reset_panel', { limitsView, codexEnabled, readFailed, count, rendered }),
+  bankedResetPanel: (limitsView: boolean, codexEnabled: boolean, readFailed: boolean, count: number | null, rendered: boolean,
+    observedAt: [number | null, number | null]) =>
+    invoke<void>('record_banked_reset_panel', { limitsView, codexEnabled, readFailed, count, rendered, observedAt }),
   quotaHistory: (key: QuotaKey) => invoke<QuotaHistory>('get_quota_history', { key }),
   resetQuotaForecast: (key: QuotaKey) => invoke<Quotas>('reset_quota_forecast', { key }),
   forecastUpdated: (callback: (snapshot: Quotas) => void) =>

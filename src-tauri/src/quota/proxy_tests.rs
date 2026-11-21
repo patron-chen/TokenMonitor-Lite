@@ -8,6 +8,7 @@ use std::{
 
 use serde_json::{json, Value};
 
+use crate::app_log::{AppLog, LOG_FILE};
 use super::{powershell_json, QUOTA_SCRIPT, REMOTE_HELPER_TIMEOUT};
 
 #[test]
@@ -51,10 +52,10 @@ fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
         requests
     });
 
-    let auth = std::env::temp_dir().join(format!("token-monitor-proxy-test-{}.json", std::process::id()));
-    let log = auth.with_extension("log");
-    fs::write(&log, "").unwrap();
-    fs::write(&auth, r#"{"tokens":{"access_token":"codex-fixture"}}"#).unwrap();
+    let root = std::env::temp_dir().join(format!("token-monitor-proxy-test-{}", std::process::id()));
+    let auth = root.join("auth.json");
+    let log = AppLog::new(&root);
+    fs::write(&auth, r#"{"tokens":{"access_token":"codex-fixture","account_id":"quota-account-fixture"}}"#).unwrap();
     let helper = QUOTA_SCRIPT
         .replace("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", "http://quota.invalid/resets")
         .replace("https://api.deepseek.com/user/balance", "http://quota.invalid/balance");
@@ -74,7 +75,7 @@ $direct = Get-QuotaResponse $env:QUOTA_TEST_ORIGIN @{}
 $bypassed = Get-LiteProxy 'https://sub.other.invalid/path'
 $unrelated = Get-LiteProxy 'https://notother.invalid/'
 $env:HTTP_PROXY = 'http://user:proxy-secret-fixture@' + ([uri]$env:ALL_PROXY).Authority
-$curl = Get-QuotaResponse 'http://quota.invalid/resets' @{Authorization='Bearer codex-fixture'} ${function:Write-BankedResetLog}
+$curl = Get-QuotaResponse 'http://quota.invalid/resets' @{Authorization='Bearer codex-fixture'} ${function:Write-BankedResetTrace}
 ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fallback; direct = $direct; loopback = $loopback; shortcutBypass = $shortcutBypass; bypassed = $bypassed; unrelated = $unrelated; curl = $curl }
 "#;
     let script = format!("$providers = . {{\n{helper}\n}} | ConvertFrom-Json\n{probes}");
@@ -86,13 +87,15 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
         ("QUOTA_TEST_ORIGIN", origin.as_ref()),
         ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex,dsh".as_ref()),
         ("TOKEN_MONITOR_LITE_CODEX_AUTH", auth.as_os_str()), ("DEEPSEEK_API_KEY", "deepseek-fixture".as_ref()),
-        ("TOKEN_MONITOR_LITE_BANKED_LOG", log.as_os_str()),
-    ], REMOTE_HELPER_TIMEOUT);
+    ], REMOTE_HELPER_TIMEOUT, &log);
     fs::remove_file(auth).unwrap();
     drop(TcpStream::connect(address).unwrap());
     let requests = server.join().unwrap();
-    let trace = fs::read_to_string(&log).unwrap();
-    fs::remove_file(log).unwrap();
+    let logs = root.join("logs");
+    let trace = fs::read_to_string(logs.join(LOG_FILE)).unwrap();
+    fs::remove_file(logs.join(LOG_FILE)).unwrap();
+    fs::remove_dir(logs).unwrap();
+    fs::remove_dir(root).unwrap();
 
     let result = result.expect("quota helper JSON");
     assert_eq!(result["providers"]["codex_reset"]["available_count"], 3);
@@ -112,7 +115,7 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
     {
         assert!(trace.contains(expected), "missing {expected} in {trace}");
     }
-    for private in ["codex-fixture", "deepseek-fixture", "proxy-secret-fixture", "quota.invalid", "127.0.0.1", "/resets"]
+    for private in ["codex-fixture", "quota-account-fixture", "deepseek-fixture", "proxy-secret-fixture", "quota.invalid", "127.0.0.1", "/resets"]
     {
         assert!(!trace.contains(private));
     }
@@ -147,7 +150,7 @@ ConvertTo-Json -InputObject @{completed=$completed; elapsed=$watch.ElapsedMillis
 "#);
     let result: Result<Value, _> = powershell_json(script, &[
         (crate::network::PROXY_SERVER_ENV, proxy.as_ref()), ("NO_PROXY", "".as_ref()),
-    ], Duration::from_secs(10));
+    ], Duration::from_secs(10), &AppLog::default());
     let _ = TcpStream::connect(address);
     assert!(server.join().unwrap());
     let result = result.unwrap();
@@ -158,9 +161,9 @@ ConvertTo-Json -InputObject @{completed=$completed; elapsed=$watch.ElapsedMillis
 #[test]
 fn banked_reset_failures_are_distinguishable_without_logging_account_or_response_text()
 {
-    let auth = std::env::temp_dir().join(format!("token-monitor-banked-test-{}.json", std::process::id()));
-    let log = auth.with_extension("log");
-    fs::write(&log, "").unwrap();
+    let root = std::env::temp_dir().join(format!("token-monitor-banked-test-{}", std::process::id()));
+    let auth = root.join("auth.json");
+    let log = AppLog::new(&root);
     let probes = r#"
 function Invoke-LiteHttpRequest([uri]$Uri, $Headers, [int]$TimeoutMs, [scriptblock]$Trace)
 {
@@ -168,6 +171,7 @@ function Invoke-LiteHttpRequest([uri]$Uri, $Headers, [int]$TimeoutMs, [scriptblo
     return @{Status=$script:status; Text=$script:body}
 }
 $file = $env:TOKEN_MONITOR_LITE_CODEX_AUTH
+[Console]::Error.WriteLine('private-untagged-stderr')
 $env:TOKEN_MONITOR_LITE_CODEX_AUTH = $file + '.missing'
 $null = Get-CodexBankedReset
 $env:TOKEN_MONITOR_LITE_CODEX_AUTH = $file
@@ -186,12 +190,15 @@ Write-Output 'true'
 "#;
     let script = format!(". {{\n{QUOTA_SCRIPT}\n}} | Out-Null\n{probes}");
     let result: Result<bool, _> = powershell_json(&script, &[
-        ("TOKEN_MONITOR_LITE_CODEX_AUTH", auth.as_os_str()), ("TOKEN_MONITOR_LITE_BANKED_LOG", log.as_os_str()),
+        ("TOKEN_MONITOR_LITE_CODEX_AUTH", auth.as_os_str()),
         ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "".as_ref()),
-    ], Duration::from_secs(12));
-    let trace = fs::read_to_string(&log).unwrap();
+    ], Duration::from_secs(12), &log);
+    let logs = root.join("logs");
+    let trace = fs::read_to_string(logs.join(LOG_FILE)).unwrap();
     fs::remove_file(&auth).unwrap();
-    fs::remove_file(log).unwrap();
+    fs::remove_file(logs.join(LOG_FILE)).unwrap();
+    fs::remove_dir(logs).unwrap();
+    fs::remove_dir(root).unwrap();
     assert!(result.unwrap());
     for expected in ["auth result=file_missing", "failure stage=auth_json", "auth result=no_access_token api_key_present=True",
         "auth result=ready account_header=True", "failure stage=request hresult=0x", "http status=401", "http status=403",
@@ -259,7 +266,7 @@ fn socks5_retries_with_proxy_dns_and_preserves_headers_and_json_body()
         (crate::network::PROXY_SERVER_ENV, "".as_ref()),
         ("QUOTA_TEST_BODY", PAYLOAD.as_ref()),
         ("HTTP_PROXY", proxy.as_ref()), ("NO_PROXY", "".as_ref()), ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "".as_ref()),
-    ], Duration::from_secs(15));
+    ], Duration::from_secs(15), &AppLog::default());
     TcpStream::connect(address).unwrap().write_all(&[0, 0]).unwrap();
     server.join().unwrap();
     assert_eq!(result.unwrap(), json!({

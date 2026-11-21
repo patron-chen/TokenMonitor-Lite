@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::app_log::{AppLog, LOG_FILE};
 use super::*;
 
 const T: i64 = 1_800_000_000_000;
@@ -190,18 +193,19 @@ fn reset_persists_for_only_the_selected_tool_group_and_duration()
         }
     };
     let key = QuotaKey::Window { tool: "antigravity".into(), group: "Gemini".into(), minutes: Some(10_080) };
-    let cache = QuotaCache::new(&root);
+    let log = Arc::new(AppLog::new(&root));
+    let cache = QuotaCache::new(&root, log.clone());
     check(&refresh(&cache), false);
     let history = quota_history::read(&db, &key, now).unwrap();
     check(&cache.reset_forecast(&key, tools).unwrap(), true);
     check(&cache.cached(tools).unwrap(), true);
-    check(&refresh(&QuotaCache::new(&root)), true);
+    check(&refresh(&QuotaCache::new(&root, log)), true);
     let after = quota_history::read(&db, &key, now).unwrap();
     assert_eq!(history.len(), 2);
     assert!(history.iter().map(|p| (p.at, p.value, p.reset_at)).eq(after.iter().map(|p| (p.at, p.value, p.reset_at))));
     drop(db);
     fs::remove_file(root.join("quota-history.sqlite")).unwrap();
-    fs::remove_file(root.join("logs/codex-banked-reset.log")).unwrap();
+    fs::remove_file(root.join("logs").join(LOG_FILE)).unwrap();
     fs::remove_dir(root.join("logs")).unwrap();
     fs::remove_dir(root).unwrap();
 }
@@ -242,8 +246,8 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
     for pass in 0..3
     {
         if pass == 2 { fs::write(&live, &lines).unwrap(); }
-        let cache = QuotaCache::new(&root);
-        cache.sample_local(&sources, tools);
+        let cache = QuotaCache::new(&root, Arc::new(AppLog::new(&root)));
+        cache.sample_local(&sources, tools, "test");
         let snapshot = cache.read(&sources, settings, true);
         let values = &snapshot.tools[0].windows;
         assert_eq!(values.len(), 2);
@@ -257,7 +261,7 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
     fs::remove_file(live).unwrap();
     fs::remove_file(archived).unwrap();
     fs::remove_file(root.join("quota-history.sqlite")).unwrap();
-    fs::remove_file(root.join("logs/codex-banked-reset.log")).unwrap();
+    fs::remove_file(root.join("logs").join(LOG_FILE)).unwrap();
     fs::remove_dir(root.join("logs")).unwrap();
     fs::remove_dir(active).unwrap();
     fs::remove_dir(archive).unwrap();

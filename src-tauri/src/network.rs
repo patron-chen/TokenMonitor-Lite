@@ -34,12 +34,12 @@ pub(crate) fn proxy_server(args: impl IntoIterator<Item = impl AsRef<str>>) -> O
     proxy
 }
 
-pub(crate) fn start_powershell(script: &str, vars: &[(&str, &OsStr)], input: Stdio) -> Option<Child>
+pub(crate) fn start_powershell(script: &str, vars: &[(&str, &OsStr)], input: Stdio, stderr: Stdio) -> Option<Child>
 {
     let powershell = PathBuf::from(std::env::var_os("SystemRoot")?).join("System32/WindowsPowerShell/v1.0/powershell.exe");
     Command::new(powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .envs(vars.iter().copied()).stdin(input).stdout(Stdio::piped()).stderr(Stdio::null())
+        .envs(vars.iter().copied()).stdin(input).stdout(Stdio::piped()).stderr(stderr)
         .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW).spawn().ok()
 }
 
@@ -71,7 +71,7 @@ impl HttpWorker
 // Discovery and all subsequent loopback RPCs share one helper and one overall time budget.
 pub(crate) fn with_http_worker<T>(script: &str, deadline: Instant, action: impl FnOnce(&mut HttpWorker) -> Option<T>) -> Option<T>
 {
-    let mut child = start_powershell(script, &[], Stdio::piped())?;
+    let mut child = start_powershell(script, &[], Stdio::piped(), Stdio::null())?;
     let input = child.stdin.take().expect("HTTP worker stdin");
     let stdout = child.stdout.take().expect("HTTP worker stdout");
     thread::scope(|scope| {

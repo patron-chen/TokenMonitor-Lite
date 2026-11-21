@@ -146,7 +146,7 @@ function Get-NetTCPConnection
     [pscustomobject]@{OwningProcess=17;LocalPort=2233}
 }
 "#, include_str!("../antigravity_endpoints.ps1"));
-    let endpoints: Vec<Endpoint> = powershell_json(script, &[], Duration::from_secs(8)).unwrap();
+    let endpoints: Vec<Endpoint> = powershell_json(script, &[], Duration::from_secs(8), &AppLog::default()).unwrap();
     let actual: Vec<_> = endpoints.iter().map(|ep| (ep.rank, ep.port, ep.secure, ep.csrf.as_str())).collect();
     assert_eq!(actual, [(0, 1122, true, "main-test"), (0, 1122, false, "main-test"),
         (0, 2233, true, "main-test"), (0, 2233, false, "main-test"), (0, 3344, false, "ext-test")]);

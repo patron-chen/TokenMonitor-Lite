@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::app_log::AppLog;
 use crate::network::{with_http_worker, HttpWorker};
 use super::{antigravity_quota, ToolQuota};
 
@@ -22,15 +23,41 @@ struct Endpoint
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Rpc { Summary, UserStatus, ModelConfigs }
 
-pub(super) fn read() -> Option<ToolQuota>
+pub(super) fn read(log: &AppLog, trigger: &str) -> Option<ToolQuota>
 {
     const SCRIPT: &str = concat!(include_str!("../../../scripts/windows-http.ps1"), "\n",
         include_str!("antigravity_endpoints.ps1"), "\nRead-LiteHttpRequests");
     let deadline = Instant::now() + Duration::from_secs(13);
-    with_http_worker(SCRIPT, deadline, |worker| {
+    log.reading(trigger, "antigravity", "local_rpc", "started", None);
+    let mut result = "discovery_failed";
+    let quota = with_http_worker(SCRIPT, deadline, |worker| {
         let endpoints: Vec<Endpoint> = worker.read_json(Duration::from_secs(8))?;
-        probe(&endpoints, deadline, |endpoint, rpc, timeout| request(worker, endpoint, rpc, timeout))
-    })
+        log.write(format_args!("quota discovery trigger={trigger} tool=antigravity endpoints={}", endpoints.len()));
+        if endpoints.is_empty()
+        {
+            result = "no_endpoints";
+            return None;
+        }
+        let mut requests = 0;
+        let mut replies = 0;
+        let quota = probe(&endpoints, deadline, |endpoint, rpc, timeout| {
+            requests += 1;
+            let reply = request(worker, endpoint, rpc, timeout);
+            if reply.is_some() { replies += 1; }
+            reply
+        });
+        result = match (quota.is_some(), requests, replies)
+        {
+            (true, _, _) => "read",
+            (false, 0, _) => "deadline_before_rpc",
+            (false, _, 0) => "rpc_failed",
+            (false, _, _) => "no_usable_reading",
+        };
+        log.write(format_args!("quota rpc trigger={trigger} tool=antigravity requests={requests} json_replies={replies}"));
+        quota
+    });
+    log.reading(trigger, "antigravity", "local_rpc", result, quota.as_ref());
+    quota
 }
 
 fn plan(status: &Value) -> Option<String>

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_log;
 mod backdrop;
 mod cache;
 mod detail;
@@ -25,6 +26,7 @@ use tauri::{
     WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
+use app_log::AppLog;
 use detail::{Detail, Sort};
 use engine::{current_span, CollectionStatus, Engine, Interaction, Update};
 use model::{Activity, Period, SessionPage, Summary};
@@ -142,6 +144,10 @@ fn open(app: &AppHandle, anchor: Option<Rect>)
 {
     if let Err(error) = show_details(app, anchor)
     {
+        if let Some(log) = app.try_state::<Arc<AppLog>>()
+        {
+            log.write(format_args!("panel open result=failed error={error}"));
+        }
         eprintln!("Unable to open details: {error}");
         if let Some(tray) = app.tray_by_id("usage")
         {
@@ -303,9 +309,10 @@ async fn get_quotas(
 #[tauri::command]
 fn record_banked_reset_panel(
     quotas: State<'_, Arc<QuotaCache>>, limits_view: bool, codex_enabled: bool, read_failed: bool, count: Option<u64>, rendered: bool,
+    observed_at: Option<[Option<i64>; 2]>,
 )
 {
-    quotas.record_banked_reset_panel(limits_view, codex_enabled, read_failed, count, rendered);
+    quotas.record_banked_reset_panel(limits_view, codex_enabled, read_failed, count, rendered, observed_at.unwrap_or_default());
 }
 
 #[tauri::command]
@@ -486,11 +493,13 @@ fn main()
         .setup(|app| {
             let root = app_data_root();
             fs::create_dir_all(&root)?;
+            let log = Arc::new(AppLog::new(&root));
+            app.manage(log.clone());
             let preferences = Arc::new(PreferencesStore::load(&root));
             app.manage(preferences.clone());
             let chinese = preferences.get().language.resolve() == Language::Chinese;
             let handle = app.handle().clone();
-            let quotas = Arc::new(QuotaCache::new(&root));
+            let quotas = Arc::new(QuotaCache::new(&root, log.clone()));
             let panel = handle.clone();
             let display_cache = quotas.clone();
             let display_preferences = preferences.clone();
@@ -505,7 +514,7 @@ fn main()
             })?;
             app.manage(quotas);
             app.manage(sampler);
-            let engine = Engine::start(&root, scanner_path()?, preferences, usage_signal, move |period, revision, today| {
+            let engine = Engine::start(&root, scanner_path()?, preferences, usage_signal, log.clone(), move |period, revision, today| {
                 let callback_handle = handle.clone();
                 let _ = handle.run_on_main_thread(move || {
                     if let (Some(summary), Some(tray)) = (today, callback_handle.tray_by_id("usage"))
@@ -570,6 +579,7 @@ fn main()
                 .build(app)?;
             let saved = fs::read(app_data_root().join("appearance.json")).unwrap_or_default();
             *app.state::<WindowMemory>().appearance.lock().expect("appearance") = decode_appearance(&saved);
+            log.write(format_args!("startup result=ready"));
             if std::env::args_os().any(|arg| arg == "--open")
             {
                 open(app.handle(), None);
@@ -582,10 +592,11 @@ fn main()
             match event
             {
                 RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
-                RunEvent::ExitRequested { code: Some(_), .. } =>
+                RunEvent::ExitRequested { code: Some(code), .. } =>
                 {
                     app.state::<Arc<Engine>>().shutdown();
                     app.state::<Sampler>().shutdown();
+                    app.state::<Arc<AppLog>>().write(format_args!("shutdown code={code}"));
                 }
                 _ => {}
             }

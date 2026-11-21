@@ -238,9 +238,12 @@
     // Check the committed DOM so a positive backend count can be compared with the row on screen.
     await tick();
     if (request !== quotaRequest || !quotaVisible) return;
-    const count = shownQuotas?.tools.find(provider => provider.tool === 'codex')?.bankedReset?.availableCount ?? null;
+    const codex = shownQuotas?.tools.find(provider => provider.tool === 'codex');
+    const antigravity = shownQuotas?.tools.find(provider => provider.tool === 'antigravity');
+    const count = codex?.bankedReset?.availableCount ?? null;
     const rendered = !!viewport?.querySelector('.quota-banked');
-    await backend.bankedResetPanel(route.view === 'limits', preferences.quotas.tools.codex, readFailed, count, rendered).catch(() => {});
+    await backend.bankedResetPanel(route.view === 'limits', preferences.quotas.tools.codex, readFailed, count, rendered,
+      [codex?.windows.length ? codex.observedAt : null, antigravity?.observedAt ?? null]).catch(() => {});
   }
 
   async function loadQuotas(force = false)

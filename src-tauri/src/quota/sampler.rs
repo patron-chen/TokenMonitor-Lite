@@ -118,6 +118,7 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
     let sources = Sources::discover();
     let mut schedule = Schedule::default();
     let mut active = false;
+    let mut startup = true;
     loop
     {
         let settings = store.get();
@@ -125,9 +126,23 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
         let now = Instant::now();
         let interval = Duration::from_secs(u64::from(settings.quotas.refresh_minutes) * 60);
         let tools = schedule.take(now, interval);
-        if tools.any()
+        if startup
         {
-            cache.sample_local(&sources, tools);
+            let result = if tools.any() { "scheduled" } else { "no_enabled_tools" };
+            cache.log.write(format_args!(
+                "quota startup result={result} codex_collection={} codex_quota={} antigravity_collection={} antigravity_quota={} refresh_minutes={} banked_reset=panel_only",
+                settings.collection.tools.codex, settings.quotas.tools.codex,
+                settings.collection.tools.antigravity, settings.quotas.tools.antigravity, settings.quotas.refresh_minutes));
+            if tools.any()
+            {
+                cache.sample_local(&sources, tools, "startup");
+                changed();
+            }
+            startup = false;
+        }
+        else if tools.any()
+        {
+            cache.sample_local(&sources, tools, "background");
             changed();
         }
         let now = Instant::now();
