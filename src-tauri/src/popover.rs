@@ -4,6 +4,19 @@ use tauri::PhysicalPosition;
 const TRAY_PRESS_WINDOW: Duration = Duration::from_millis(250);
 const SAME_PRESS_DISTANCE: f64 = 8.0;
 
+#[cfg(windows)]
+pub(crate) fn cursor_outside_tray(rect: &tauri::Rect) -> bool
+{
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+    let mut cursor = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut cursor) } == 0 { return false; }
+    // Native tray events supply physical screen coordinates, including on secondary displays.
+    let origin = rect.position.to_physical::<i32>(1.0);
+    let size = rect.size.to_physical::<u32>(1.0);
+    !(origin.x..origin.x + size.width as i32).contains(&cursor.x) ||
+        !(origin.y..origin.y + size.height as i32).contains(&cursor.y)
+}
+
 #[derive(Default)]
 pub struct Popover
 {

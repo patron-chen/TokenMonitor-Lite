@@ -26,7 +26,7 @@ use tauri::{
 };
 
 use detail::{Detail, Sort};
-use engine::{current_span, CollectionStatus, Engine, Update};
+use engine::{current_span, CollectionStatus, Engine, Interaction, Update};
 use model::{Activity, Period, SessionPage, Summary};
 use popover::Popover;
 use quota::{QuotaCache, Quotas};
@@ -113,6 +113,7 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
                 (cfg!(debug_assertions) && url.host_str() == Some("127.0.0.1"))
         })
         .build()?;
+    app.state::<Arc<Engine>>().interact(Interaction::Window(true));
     if let Some(target) = placement
     {
         // Move to the tray's monitor before applying the size in that monitor's DPI.
@@ -452,10 +453,11 @@ fn main()
                 {
                     let _ = close_details(app);
                 }
-                #[cfg(windows)]
                 WindowEvent::Destroyed =>
                 {
+                    app.state::<Arc<Engine>>().interact(Interaction::Window(false));
                     *memory.backdrop.lock().expect("window material") = None;
+                    #[cfg(windows)]
                     backdrop::release();
                 }
                 #[cfg(windows)]
@@ -487,45 +489,6 @@ fn main()
             let preferences = Arc::new(PreferencesStore::load(&root));
             app.manage(preferences.clone());
             let chinese = preferences.get().language.resolve() == Language::Chinese;
-            let menu = tray_menu(app.handle(), chinese)?;
-            TrayIconBuilder::with_id("usage")
-                .icon(app.default_window_icon().expect("application icon").clone())
-                .tooltip("Token Monitor Lite")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref()
-                {
-                    "open" => open(app, None),
-                    "refresh" => app.state::<Arc<Engine>>().refresh(Period::Today),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state, position, rect, .. } = event
-                    {
-                        let app = tray.app_handle();
-                        let memory = app.state::<WindowMemory>();
-                        let open_or_loading = app.get_webview_window(WINDOW).is_some();
-                        if button_state == MouseButtonState::Down
-                        {
-                            memory.popover.lock().expect("popover").tray_down(open_or_loading, position, Instant::now());
-                            return;
-                        }
-                        let closes = memory.popover.lock().expect("popover").tray_up(open_or_loading, position, Instant::now());
-                        if closes
-                        {
-                            let _ = close_details(app);
-                        }
-                        else
-                        {
-                            let size: PhysicalSize<u32> = rect.size.to_physical(1.0);
-                            let anchor = if size.width > 0 && size.height > 0 { rect }
-                                else { Rect { position: position.into(), size: PhysicalSize::new(1, 1).into() } };
-                            open(app, Some(anchor));
-                        }
-                    }
-                })
-                .build(app)?;
             let handle = app.handle().clone();
             let quotas = Arc::new(QuotaCache::new(&root));
             let panel = handle.clone();
@@ -542,8 +505,7 @@ fn main()
             })?;
             app.manage(quotas);
             app.manage(sampler);
-            let engine = Engine::start(&root, scanner_path()?, preferences, move |period, revision, today| {
-                if let Some(summary) = &today { usage_signal.updated(summary); }
+            let engine = Engine::start(&root, scanner_path()?, preferences, usage_signal, move |period, revision, today| {
                 let callback_handle = handle.clone();
                 let _ = handle.run_on_main_thread(move || {
                     if let (Some(summary), Some(tray)) = (today, callback_handle.tray_by_id("usage"))
@@ -558,6 +520,54 @@ fn main()
                 });
             })?;
             app.manage(Arc::new(engine));
+            let menu = tray_menu(app.handle(), chinese)?;
+            TrayIconBuilder::with_id("usage")
+                .icon(app.default_window_icon().expect("application icon").clone())
+                .tooltip("Token Monitor Lite")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref()
+                {
+                    "open" => open(app, None),
+                    "refresh" => app.state::<Arc<Engine>>().interact(Interaction::Refresh),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    let app = tray.app_handle();
+                    match event
+                    {
+                        TrayIconEvent::Enter { rect, .. } | TrayIconEvent::Move { rect, .. } =>
+                        {
+                            app.state::<Arc<Engine>>().tray_hover(Some(rect));
+                        }
+                        TrayIconEvent::Leave { .. } => app.state::<Arc<Engine>>().tray_hover(None),
+                        TrayIconEvent::Click { button: MouseButton::Left, button_state, position, rect, .. } =>
+                        {
+                            let memory = app.state::<WindowMemory>();
+                            let open_or_loading = app.get_webview_window(WINDOW).is_some();
+                            if button_state == MouseButtonState::Down
+                            {
+                                memory.popover.lock().expect("popover").tray_down(open_or_loading, position, Instant::now());
+                                return;
+                            }
+                            let closes = memory.popover.lock().expect("popover").tray_up(open_or_loading, position, Instant::now());
+                            if closes
+                            {
+                                let _ = close_details(app);
+                            }
+                            else
+                            {
+                                let size: PhysicalSize<u32> = rect.size.to_physical(1.0);
+                                let anchor = if size.width > 0 && size.height > 0 { rect }
+                                    else { Rect { position: position.into(), size: PhysicalSize::new(1, 1).into() } };
+                                open(app, Some(anchor));
+                            }
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
             let saved = fs::read(app_data_root().join("appearance.json")).unwrap_or_default();
             *app.state::<WindowMemory>().appearance.lock().expect("appearance") = decode_appearance(&saved);
             if std::env::args_os().any(|arg| arg == "--open")

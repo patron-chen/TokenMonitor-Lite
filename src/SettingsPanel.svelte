@@ -31,10 +31,10 @@
     100: local('Standard', '标准'), 110: local('Larger', '较大'), 120: local('Largest', '最大')
   });
   const cadences: Record<Cadence, string> = $derived({
-    live: local('Live watch', '实时监看'),
-    '5m': local('Every 5 minutes', '每 5 分钟'),
-    '15m': local('Every 15 minutes', '每 15 分钟'),
-    '30m': local('Every 30 minutes', '每 30 分钟')
+    '5m': local('5 minutes', '5 分钟'),
+    '15m': local('15 minutes', '15 分钟'),
+    live: local('20 minutes (default)', '20 分钟（默认）'),
+    '30m': local('30 minutes', '30 分钟')
   });
   const quotaSetup: Record<ToolId, { methods: string[]; instructions: string }> = $derived({
     codex: {
@@ -54,7 +54,6 @@
     }
   });
   let expandedTool = $state<ToolId | null>(null);
-  let live = $derived(preferences.collection.cadence === 'live');
   let tracked = $derived(toolIds.filter(tool => preferences.collection.tools[tool]).length);
   let enabledQuotas = $derived(toolIds.filter(tool => preferences.quotas.tools[tool]).length);
   let collecting = $derived(!!collection?.scanning);
@@ -63,7 +62,7 @@
   function summary(id: SettingsSection)
   {
     if (id === 'appearance') return sizes[appearance.fontScale] + ' · ' + appearance.opacity + '%';
-    if (id === 'collection') return cadences[preferences.collection.cadence];
+    if (id === 'collection') return local(`${tracked} tools · live`, `${tracked} 个工具 · 实时`);
     return local(`${enabledQuotas} enabled · ${quotaMinutes} min`, `启用 ${enabledQuotas} · ${quotaMinutes} 分钟`);
   }
 
@@ -80,7 +79,6 @@
     if (!tracked) return local('No tools enabled', '未启用采集工具');
     if (collection?.failure) return local('Last scan failed', '上次采集失败');
     if (!collection) return '—';
-    if (!live) return local('Scheduled', '定时采集');
     return collection.watching ? local('Watching', '正在监看') : local('Watch unavailable', '监看不可用');
   }
 </script>
@@ -187,7 +185,7 @@
               </p>
             </div>
             <div class="settings-item">
-              <label for="collection-cadence">{local('Collection frequency', '采集频率')}</label>
+              <label for="collection-cadence">{local('Maximum idle tray interval', '托盘空闲最长间隔')}</label>
               <select id="collection-cadence" value={preferences.collection.cadence} disabled={busy.settings}
                 aria-describedby="collection-cadence-note" onchange={event => setPreferences({
                   ...preferences, collection: { ...preferences.collection, cadence: event.currentTarget.value as Cadence }
@@ -195,8 +193,8 @@
                 {#each Object.entries(cadences) as [value, label] (value)}<option {value}>{label}</option>{/each}
               </select>
               <p id="collection-cadence-note" class="settings-note">
-                {live ? local('Collect today’s usage when local logs change.', '日志变更后约 3–5 秒采集今日用量。')
-                  : local('Collect today’s usage on this schedule.', '按此间隔采集今日用量。')}
+                {local('Opening the window or hovering over the tray icon refreshes immediately and enables live updates. Idle checks start at 1 minute and gradually reach this limit.',
+                  '打开窗口或悬停托盘图标会立即刷新，并实时监看日志。收起窗口且鼠标离开后，从 1 分钟起逐步延长到此上限。')}
               </p>
             </div>
             <div class="settings-item">

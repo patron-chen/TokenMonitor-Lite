@@ -10,16 +10,21 @@ use std::{
 };
 
 use chrono::{Days, NaiveDate, Utc, Weekday};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{event::{CreateKind, ModifyKind, RemoveKind, RenameMode}, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
     cache::{Cache, Report}, model::{next_midnight, system_zone, Activity, DailyUsage, Period, SessionPage, Span, Summary, PAGE_SIZE},
     pricing::Pricing,
+    quota::sampler::UsageSignal,
     settings::{CollectionSettings, PreferencesStore, ToolSelection},
     sources::Sources,
     session_metadata,
 };
+
+mod schedule;
+use schedule::Schedule;
+pub(crate) use schedule::Interaction;
 
 const QUIET: Duration = Duration::from_secs(3);
 const MAX_WAIT: Duration = Duration::from_secs(5);
@@ -37,6 +42,7 @@ enum Signal
     Scan(Period),
     Activity(bool, mpsc::Sender<Result<Activity, String>>),
     Watched,
+    Interaction(Interaction),
     Resume,
     Quit,
 }
@@ -68,6 +74,7 @@ pub struct Engine
     pub cache: Cache,
     preferences: Arc<PreferencesStore>,
     signals: mpsc::Sender<Signal>,
+    tray: Arc<Mutex<Option<tauri::Rect>>>,
     progress: Arc<Mutex<HashMap<Period, Progress>>>,
     watching: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -77,7 +84,7 @@ pub struct Engine
 impl Engine
 {
     pub fn start(
-        root: &Path, scanner: PathBuf, preferences: Arc<PreferencesStore>,
+        root: &Path, scanner: PathBuf, preferences: Arc<PreferencesStore>, samples: UsageSignal,
         changed: impl Fn(Period, u64, Option<Summary>) + Send + 'static,
     ) -> Result<Self, Box<dyn std::error::Error>>
     {
@@ -90,13 +97,15 @@ impl Engine
         let progress = Arc::new(Mutex::new(HashMap::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let watching = Arc::new(AtomicBool::new(false));
+        let tray = Arc::new(Mutex::new(None));
         let worker = Worker {
             cache: cache.clone(), sources: sources.clone(), config, scanner,
             preferences: preferences.clone(), watching: watching.clone(),
             signals: signals.clone(), receiver, progress: progress.clone(), stopped: stopped.clone(), changed,
+            tray: tray.clone(), samples,
         };
         let worker = thread::Builder::new().name("usage-scan".into()).spawn(move || worker.run())?;
-        let engine = Self { cache, sources, preferences, signals, progress, watching, stopped, worker: Mutex::new(Some(worker)) };
+        let engine = Self { cache, sources, preferences, signals, tray, progress, watching, stopped, worker: Mutex::new(Some(worker)) };
         engine.refresh(Period::Today);
         Ok(engine)
     }
@@ -111,6 +120,19 @@ impl Engine
             state.failure = None;
             let _ = self.signals.send(Signal::Scan(period));
         }
+    }
+
+    pub(crate) fn interact(&self, event: Interaction)
+    {
+        let _ = self.signals.send(Signal::Interaction(event));
+    }
+
+    pub(crate) fn tray_hover(&self, bounds: Option<tauri::Rect>)
+    {
+        let mut previous = self.tray.lock().expect("tray bounds");
+        let inside = bounds.is_some();
+        if inside != previous.is_some() { self.interact(Interaction::Tray(inside)); }
+        *previous = bounds;
     }
 
     pub fn summary(&self, period: Period) -> rusqlite::Result<Summary>
@@ -253,6 +275,8 @@ struct Worker<F>
     preferences: Arc<PreferencesStore>,
     watching: Arc<AtomicBool>,
     signals: mpsc::Sender<Signal>,
+    tray: Arc<Mutex<Option<tauri::Rect>>>,
+    samples: UsageSignal,
     receiver: mpsc::Receiver<Signal>,
     progress: Arc<Mutex<HashMap<Period, Progress>>>,
     stopped: Arc<AtomicBool>,
@@ -267,13 +291,10 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
         let mut settings = self.preferences.get().collection;
         let mut roots = self.watch_roots(settings);
         let mut watcher = open_watcher(roots.clone(), writes.clone(), self.signals.clone());
-        self.watching.store(watcher.is_some(), Ordering::Relaxed);
-        let deadline = |settings: CollectionSettings| settings.cadence.interval()
-            .filter(|_| settings.tools.any()).map(|delay| Instant::now() + delay);
-        let mut scheduled = deadline(settings);
         let _resume = resume::register(self.signals.clone());
         let mut watches = HashMap::new();
-        let mut queued = VecDeque::new();
+        let mut sync_needed = true;
+        let mut work = Work::new();
         let mut period_key = current_span(Period::Today).key();
         let mut revision = 0;
         self.publish(Period::Today, revision);
@@ -281,7 +302,7 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
         {
             while let Ok(signal) = self.receiver.try_recv()
             {
-                if !queue(&mut queued, signal) { return; }
+                if !work.receive(signal, &self.samples) { return; }
             }
             let requested = self.preferences.get().collection;
             if settings != requested
@@ -295,38 +316,40 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
                     watches.clear();
                     roots = next_roots;
                     watcher = open_watcher(roots.clone(), writes.clone(), self.signals.clone());
-                    self.watching.store(watcher.is_some(), Ordering::Relaxed);
+                    sync_needed = true;
                 }
-                scheduled = deadline(settings);
+                work.schedule.restart(Instant::now());
                 revision += 1;
                 self.publish(Period::Today, revision);
-            }
-            if scheduled.is_some_and(|due| due <= Instant::now())
-            {
-                queue(&mut queued, Signal::Scan(Period::Today));
-                scheduled = deadline(settings);
             }
             let today = current_span(Period::Today);
             let new_key = today.key();
             if period_key != new_key
             {
                 period_key = new_key;
-                queue(&mut queued, Signal::Scan(Period::Today));
+                work.invalidate();
             }
+            let now = Instant::now();
+            let idle_tick = settings.tools.any() && work.schedule.take_idle_check(now, settings.cadence);
             let watch_due = {
-                let mut writes = writes.lock().expect("watch timing");
-                if writes.is_some_and(|pending: Writes| pending.due() <= Instant::now())
+                let pending = *writes.lock().expect("watch timing");
+                let due = pending.filter(|_| work.schedule.active()).map(Writes::due);
+                // Pending quota samples can use a clean tray tick without opening the usage cache.
+                if due.is_some_and(|when| when <= now) ||
+                    (idle_tick && (pending.is_some() || work.invalidated || !self.watching.load(Ordering::Relaxed)))
                 {
-                    writes.take();
-                    queue(&mut queued, Signal::Scan(Period::Today));
+                    work.scan(Period::Today);
                 }
-                writes.map(Writes::due)
+                else if idle_tick { self.samples.collection_active(false); }
+                due
             };
-            if let Some(watcher) = &mut watcher
+            if sync_needed || matches!(work.jobs.front(), Some(Job::Scan(Period::Today)))
             {
-                sync_roots(watcher, &roots, &mut watches);
+                let covered = watcher.as_mut().is_some_and(|watcher| sync_roots(watcher, &roots, &mut watches));
+                self.watching.store(covered, Ordering::Relaxed);
+                sync_needed = false;
             }
-            if let Some(job) = queued.pop_front()
+            if let Some(job) = work.jobs.pop_front()
             {
                 let period = match job
                 {
@@ -337,6 +360,12 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
                         continue;
                     }
                 };
+                if period == Period::Today
+                {
+                    // Later notifications belong to the next scan, including changes during this one.
+                    writes.lock().expect("watch timing").take();
+                    work.invalidated = false;
+                }
                 {
                     let mut progress = self.progress.lock().expect("scan progress");
                     *progress.entry(period).or_default() = Progress { running: true, failure: None };
@@ -344,6 +373,7 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
                 revision += 1;
                 self.publish(period, revision);
                 let result = self.scan(period, settings.tools);
+                if period == Period::Today && result.is_err() { work.invalidated = true; }
                 {
                     let mut progress = self.progress.lock().expect("scan progress");
                     *progress.entry(period).or_default() = Progress { running: false, failure: result.err() };
@@ -354,20 +384,43 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
             }
             let now = Utc::now();
             let until_midnight = (next_midnight(now, today.zone) - now).to_std().unwrap_or(Duration::ZERO);
-            let until_signal = watch_due.into_iter().chain(scheduled).min()
+            let idle_due = work.schedule.idle_deadline().filter(|_| settings.tools.any());
+            let until_signal = watch_due.into_iter().chain(idle_due).min()
                 .map(|due| due.saturating_duration_since(Instant::now()))
                 .unwrap_or(until_midnight).min(until_midnight);
-            if let Ok(signal) = self.receiver.recv_timeout(until_signal)
+            if let Ok(signal) = self.wait(until_signal, work.schedule.hovered)
             {
-                if !queue(&mut queued, signal) { return; }
+                if !work.receive(signal, &self.samples) { return; }
             }
         }
     }
 
     fn watch_roots(&self, settings: CollectionSettings) -> Vec<PathBuf>
     {
-        if settings.cadence.interval().is_some() { return vec![]; }
         settings.tools.enabled().flat_map(|tool| self.sources.roots_for(tool)).collect()
+    }
+
+    fn wait(&self, delay: Duration, _hovered: bool) -> Result<Signal, mpsc::RecvTimeoutError>
+    {
+        #[cfg(windows)]
+        if _hovered
+        {
+            let until = Instant::now() + delay;
+            loop
+            {
+                let remaining = until.saturating_duration_since(Instant::now());
+                let result = self.receiver.recv_timeout(remaining.min(Duration::from_secs(1)));
+                if !matches!(result, Err(mpsc::RecvTimeoutError::Timeout)) || Instant::now() >= until { return result; }
+                // Explorer can omit Leave when the pointer jumps out after resting on the icon.
+                let mut bounds = self.tray.lock().expect("tray bounds");
+                if bounds.as_ref().is_some_and(crate::popover::cursor_outside_tray)
+                {
+                    *bounds = None;
+                    return Ok(Signal::Interaction(Interaction::Tray(false)));
+                }
+            }
+        }
+        self.receiver.recv_timeout(delay)
     }
 
     fn publish(&self, period: Period, revision: u64)
@@ -380,6 +433,7 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
                 summary.refreshing = progress.running;
                 summary.failure.clone_from(&progress.failure);
             }
+            self.samples.updated(&summary);
             summary
         });
         (self.changed)(period, revision, today);
@@ -461,26 +515,51 @@ struct GraphTotals
     tokens: u64,
 }
 
-fn queue(queued: &mut VecDeque<Job>, signal: Signal) -> bool
+struct Work
 {
-    let period = match signal
+    jobs: VecDeque<Job>,
+    schedule: Schedule,
+    invalidated: bool,
+}
+
+impl Work
+{
+    fn new() -> Self
     {
-        Signal::Quit => return false,
-        Signal::Watched => return true,
-        Signal::Resume => Period::Today,
-        Signal::Scan(period) => period,
-        Signal::Activity(force, reply) =>
-        {
-            queued.push_back(Job::Activity(force, reply));
-            return true;
-        }
-    };
-    if !queued.iter().any(|job| matches!(job, Job::Scan(queued_period) if *queued_period == period))
-    {
-        if period == Period::Today { queued.push_front(Job::Scan(period)); }
-        else { queued.push_back(Job::Scan(period)); }
+        Self { jobs: VecDeque::new(), schedule: Schedule::new(Instant::now()), invalidated: false }
     }
-    true
+
+    fn receive(&mut self, signal: Signal, samples: &UsageSignal) -> bool
+    {
+        match signal
+        {
+            Signal::Quit => return false,
+            Signal::Watched => (),
+            Signal::Resume => self.invalidate(),
+            Signal::Scan(period) => self.scan(period),
+            Signal::Activity(force, reply) => self.jobs.push_back(Job::Activity(force, reply)),
+            Signal::Interaction(event) =>
+            {
+                let active = self.schedule.active();
+                if self.schedule.interact(event, Instant::now()) { self.scan(Period::Today); }
+                if active != self.schedule.active() { samples.collection_active(self.schedule.active()); }
+            }
+        }
+        true
+    }
+
+    fn invalidate(&mut self)
+    {
+        self.invalidated = true;
+        if self.schedule.active() { self.scan(Period::Today); }
+    }
+
+    fn scan(&mut self, period: Period)
+    {
+        if self.jobs.iter().any(|job| matches!(job, Job::Scan(previous) if *previous == period)) { return; }
+        if period == Period::Today { self.jobs.push_front(Job::Scan(period)); }
+        else { self.jobs.push_back(Job::Scan(period)); }
+    }
 }
 
 fn open_watcher(
@@ -492,7 +571,7 @@ fn open_watcher(
         if let Ok(event) = event
         {
             if !event.need_rescan() && (matches!(event.kind, EventKind::Access(_)) ||
-                !event.paths.iter().any(|path| relevant(path, &roots)))
+                !event.paths.iter().any(|path| relevant(path, &roots, event.kind)))
             {
                 return;
             }
@@ -511,22 +590,32 @@ fn open_watcher(
     }).ok()
 }
 
-fn relevant(path: &Path, roots: &[PathBuf]) -> bool
+fn relevant(path: &Path, roots: &[PathBuf], kind: EventKind) -> bool
 {
     if roots.iter().any(|root| root.starts_with(path))
     {
-        return true;
+        return matches!(kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any);
     }
     if !roots.iter().any(|root| path.starts_with(root))
     {
         return false;
     }
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-    name.ends_with(".jsonl") || name.ends_with(".jsonl.zst") || name.ends_with(".jsonl.zstd")
-        || name.ends_with(".db") || name.ends_with(".db-wal") || path.is_dir()
+    if name.ends_with(".jsonl") || name.ends_with(".jsonl.zst") || name.ends_with(".jsonl.zstd")
+        || name.ends_with(".db") || name.ends_with(".db-wal") { return true; }
+    if name.ends_with(".db-shm") || name.ends_with(".db-journal") { return false; }
+    // Windows also reports Modify(Any) on date directories during a scan. Only directory
+    // creation, removal or renaming can bring an entire set of sessions into or out of scope.
+    match kind
+    {
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any) |
+            EventKind::Modify(ModifyKind::Name(RenameMode::From | RenameMode::Both)) => true,
+        EventKind::Create(CreateKind::Any) | EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any => path.is_dir(),
+        _ => false,
+    }
 }
 
-fn sync_roots(watcher: &mut RecommendedWatcher, roots: &[PathBuf], watched: &mut HashMap<PathBuf, RecursiveMode>)
+fn sync_roots(watcher: &mut RecommendedWatcher, roots: &[PathBuf], watched: &mut HashMap<PathBuf, RecursiveMode>) -> bool
 {
     let mut desired = HashMap::new();
     for root in roots
@@ -545,6 +634,7 @@ fn sync_roots(watcher: &mut RecommendedWatcher, roots: &[PathBuf], watched: &mut
         let _ = watcher.unwatch(path);
         false
     });
+    let count = desired.len();
     for (path, mode) in desired
     {
         if !watched.contains_key(&path) && watcher.watch(&path, mode).is_ok()
@@ -552,6 +642,7 @@ fn sync_roots(watcher: &mut RecommendedWatcher, roots: &[PathBuf], watched: &mut
             watched.insert(path, mode);
         }
     }
+    count > 0 && watched.len() == count
 }
 
 fn read_report(
@@ -727,15 +818,49 @@ mod tests
     use super::*;
 
     #[test]
+    fn continuous_log_notifications_do_not_activate_the_tray_or_restart_backoff()
+    {
+        let start = Instant::now();
+        let mut work = Work::new();
+        work.schedule.restart(start);
+        let samples = UsageSignal::disconnected();
+        let cadence = CollectionSettings::default().cadence;
+        let mut checks = Vec::new();
+
+        // Even a wakeup on every write must leave today's scan on the next idle slot.
+        for second in 1..=60 * 60
+        {
+            let now = start + Duration::from_secs(second);
+            assert!(work.receive(Signal::Watched, &samples));
+            assert!(!work.schedule.active() && work.jobs.is_empty());
+            if work.schedule.take_idle_check(now, cadence) { checks.push(second); }
+        }
+        assert_eq!(checks, [60, 240, 540, 1140, 2340, 3540]);
+    }
+
+    #[test]
     fn coalescing_is_bounded_and_filters_generated_sqlite_writes()
     {
         let start = Instant::now();
         assert_eq!(Writes { first: start, last: start }.due(), start + QUIET);
         assert_eq!(Writes { first: start, last: start + Duration::from_secs(4) }.due(), start + MAX_WAIT);
         let roots = vec![PathBuf::from("antigravity/conversations")];
-        assert!(relevant(Path::new("antigravity/conversations/a.db-wal"), &roots));
-        assert!(!relevant(Path::new("antigravity/conversations/a.db-shm"), &roots));
-        assert!(!relevant(Path::new("tokscale/cache/a.jsonl"), &roots));
-        assert!(relevant(Path::new("antigravity/conversations"), &roots));
+        let modified = EventKind::Modify(ModifyKind::Any);
+        assert!(relevant(Path::new("antigravity/conversations/a.db-wal"), &roots, modified));
+        assert!(!relevant(Path::new("antigravity/conversations/a.db-shm"), &roots, modified));
+        assert!(!relevant(Path::new("tokscale/cache/a.jsonl"), &roots, modified));
+        assert!(relevant(&roots[0], &roots, EventKind::Create(CreateKind::Any)));
+    }
+
+    #[test]
+    fn directory_metadata_notifications_do_not_schedule_another_scan()
+    {
+        let roots = [PathBuf::from(env!("CARGO_MANIFEST_DIR"))];
+        let child = roots[0].join("src");
+        let modified = EventKind::Modify(ModifyKind::Any);
+        assert!(!relevant(&roots[0], &roots, modified));
+        assert!(!relevant(&child, &roots, modified));
+        assert!(relevant(&child, &roots, EventKind::Create(CreateKind::Any)));
+        assert!(relevant(&child, &roots, EventKind::Modify(ModifyKind::Name(RenameMode::From))));
     }
 }

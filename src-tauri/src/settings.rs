@@ -50,7 +50,7 @@ pub enum Cadence
 {
     #[default]
     #[serde(rename = "live")]
-    Live,
+    TwentyMinutes,
     #[serde(rename = "5m")]
     FiveMinutes,
     #[serde(rename = "15m")]
@@ -61,16 +61,17 @@ pub enum Cadence
 
 impl Cadence
 {
-    pub fn interval(self) -> Option<Duration>
+    pub fn tray_limit(self) -> Duration
     {
         let minutes = match self
         {
-            Self::Live => return None,
+            // Keep the original "live" setting readable by existing installations.
+            Self::TwentyMinutes => 20,
             Self::FiveMinutes => 5,
             Self::FifteenMinutes => 15,
             Self::ThirtyMinutes => 30,
         };
-        Some(Duration::from_secs(minutes * 60))
+        Duration::from_secs(minutes * 60)
     }
 }
 

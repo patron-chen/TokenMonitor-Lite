@@ -8,13 +8,24 @@ use super::QuotaCache;
 
 const TOOLS: [&str; 2] = ["codex", "antigravity"];
 
-enum Signal { Usage([u64; 2]), Settings, Stop }
+enum Signal { Usage([u64; 2]), CollectionActive(bool), Settings, Stop }
 
 #[derive(Clone)]
 pub(crate) struct UsageSignal(Sender<Signal>);
 
 impl UsageSignal
 {
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self
+    {
+        Self(mpsc::channel().0)
+    }
+
+    pub fn collection_active(&self, active: bool)
+    {
+        let _ = self.0.send(Signal::CollectionActive(active));
+    }
+
     pub fn updated(&self, summary: &Summary)
     {
         if summary.refreshing || summary.failure.is_some() || summary.updated_at.is_none() { return; }
@@ -59,6 +70,13 @@ impl Schedule
         self.pending[i].then(|| self.last[i].map_or(now, |last| last + interval))
     }
 
+    fn deadline(&self, active: bool, now: Instant, interval: Duration) -> Option<Instant>
+    {
+        // In the tray, pending observations share the usage worker's next idle check.
+        if !active { return None; }
+        (0..2).filter_map(|i| self.due(now, interval, i)).min()
+    }
+
     fn take(&mut self, now: Instant, interval: Duration) -> ToolSelection
     {
         let [codex, antigravity] = std::array::from_fn(|i| {
@@ -99,6 +117,7 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
 {
     let sources = Sources::discover();
     let mut schedule = Schedule::default();
+    let mut active = false;
     loop
     {
         let settings = store.get();
@@ -111,10 +130,8 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
             cache.sample_local(&sources, tools);
             changed();
         }
-        // A pending trailing read has its own deadline, even if no further request is made.
         let now = Instant::now();
-        let due = (0..2).filter_map(|i| schedule.due(now, interval, i)).min();
-        let signal = match due
+        let signal = match schedule.deadline(active, now, interval)
         {
             Some(due) => receiver.recv_timeout(due.saturating_duration_since(now)),
             None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -122,6 +139,7 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
         match signal
         {
             Ok(Signal::Usage(counts)) => schedule.update(store.get(), Some(counts)),
+            Ok(Signal::CollectionActive(value)) => active = value,
             Ok(Signal::Settings) | Err(RecvTimeoutError::Timeout) => (),
             Ok(Signal::Stop) | Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -146,6 +164,8 @@ mod tests
         schedule.update(settings, Some([80, 0]));
         assert!(!schedule.take(start + Duration::from_secs(5), interval).any());
         assert_eq!(schedule.due(start, interval, 0), Some(start + interval));
+        assert_eq!(schedule.deadline(false, start, interval), None);
+        assert_eq!(schedule.deadline(true, start, interval), Some(start + interval));
         let last = schedule.take(start + interval, interval);
         assert!(last.codex && !last.antigravity && !last.dsh);
         assert!(!schedule.take(start + interval * 2, interval).any());
