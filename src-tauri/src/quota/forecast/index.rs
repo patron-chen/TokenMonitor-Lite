@@ -25,6 +25,7 @@ pub(super) const SCHEMA: &str = "
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS forecast_requests_time ON forecast_requests(tool,at);
     CREATE TABLE IF NOT EXISTS forecast_scans (tool TEXT PRIMARY KEY, at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS forecast_resets (series TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
 ";
 
 struct SourceFile

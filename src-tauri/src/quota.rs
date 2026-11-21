@@ -67,6 +67,8 @@ struct QuotaWindow
     remaining: f64,
     resets_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    forecast_reset_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     forecast: Option<forecast::Forecast>,
 }
 
@@ -143,6 +145,26 @@ impl QuotaCache
     {
         self.history.as_ref().ok_or("Quota history is unavailable.")?.preview(key)
             .map_err(|_| "Could not read the local quota history.".into())
+    }
+
+    pub fn reset_forecast(&self, key: &QuotaKey, tools: ToolSelection) -> Result<Quotas, String>
+    {
+        let QuotaKey::Window { tool, group, minutes } = key else { return Err("Expected a forecast window.".into()) };
+        if !matches!(minutes, Some(300 | 10_080)) || !matches!(tool.as_str(), "codex" | "antigravity") || !tools.contains(tool)
+        {
+            return Err("Forecast is unavailable for this window.".into());
+        }
+        let history = self.history.as_ref().ok_or("Quota history is unavailable.")?;
+        // Publish under the same lock as foreground and tray updates so an old estimate cannot reappear.
+        let _refresh = self.refreshed.lock().expect("quota refresh");
+        let mut snapshot = self.snapshot.lock().expect("quota snapshot");
+        let window = snapshot.tools.iter_mut().find(|provider| provider.tool == tool.as_str())
+            .and_then(|provider| provider.windows.iter_mut().find(|w| &w.minutes == minutes && &w.group == group))
+            .ok_or("This quota window is unavailable.")?;
+        let now = Utc::now().timestamp_millis();
+        forecast::reset(history, key, window, now).map_err(|_| "Could not save the forecast reset.".to_owned())?;
+        snapshot.observed_at = snapshot.observed_at.max(now);
+        Ok(snapshot.for_tools(tools))
     }
 
     fn sample_local(&self, sources: &Sources, tools: ToolSelection)
@@ -374,7 +396,7 @@ fn parse_codex(value: &Value) -> Option<ToolQuota>
         Some(QuotaWindow {
             group: String::new(), minutes: window["window_minutes"].as_u64(),
             remaining: (100.0 - window["used_percent"].as_f64()?).clamp(0.0, 100.0),
-            resets_at: reset_time(&window["resets_at"]), forecast: None,
+            resets_at: reset_time(&window["resets_at"]), forecast_reset_at: None, forecast: None,
         })
     }).collect();
     windows.sort_by_key(|window| window.minutes);
@@ -481,7 +503,7 @@ fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Opti
             if let (Some(fraction), Some(minutes)) = (fraction, window_minutes(bucket))
             {
                 windows.push(QuotaWindow { group: label.to_owned(), minutes: Some(minutes),
-                    remaining: percent(fraction), resets_at: reset_time(&bucket["resetTime"]), forecast: None });
+                    remaining: percent(fraction), resets_at: reset_time(&bucket["resetTime"]), forecast_reset_at: None, forecast: None });
             }
         }
     }
@@ -506,7 +528,7 @@ fn antigravity_quota(summary: &Value, configs: &Value, observed_at: i64) -> Opti
             let quota = &cfg["quotaInfo"];
             let Some(fraction) = quota["remainingFraction"].as_f64() else { continue };
             let value = QuotaWindow { group: group.to_owned(), minutes: None, remaining: percent(fraction),
-                resets_at: reset_time(&quota["resetTime"]), forecast: None };
+                resets_at: reset_time(&quota["resetTime"]), forecast_reset_at: None, forecast: None };
             if let Some(existing) = windows.iter_mut().find(|window| window.group == group)
             {
                 if value.remaining < existing.remaining { *existing = value; }

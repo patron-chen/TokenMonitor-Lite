@@ -7,16 +7,21 @@
   import QuotaBanked from './QuotaBanked.svelte';
   import QuotaHistoryCard from './QuotaHistoryCard.svelte';
 
-  interface Props { data: Quotas | null; loading: boolean; now: number; focusTool: string | null; tracked: ToolSelection }
+  interface Props
+  {
+    data: Quotas | null; loading: boolean; now: number; focusTool: string | null; tracked: ToolSelection;
+    onUpdate: (snapshot: Quotas) => void;
+  }
   interface Metric { key: QuotaKey; label: string; current: string; resetAt: number | null }
 
-  let { data, loading, now, focusTool, tracked }: Props = $props();
+  let { data, loading, now, focusTool, tracked, onUpdate }: Props = $props();
   let providers = $derived(toolIds.flatMap(tool => data?.tools.find(row => row.tool === tool) ?? []));
   let element: HTMLElement | undefined = $state();
   let card: HTMLDivElement | undefined = $state();
   let active = $state<{ metric: Metric; anchor: HTMLButtonElement; forecast: boolean } | null>(null);
   let history = $state<QuotaHistory | null>(null);
   let failed = $state(false);
+  let resetState = $state<Record<string, 'pending' | 'failed'>>({});
   let pinned = false;
   let hoverBlocked = false;
   let opening: ReturnType<typeof setTimeout> | undefined;
@@ -176,21 +181,27 @@
     opening = setTimeout(() => void open(metric, anchor), delay);
   }
 
-  function pointerReading(event: PointerEvent & { currentTarget: HTMLButtonElement }, metric: Metric)
+  function pointerReading(event: PointerEvent & { currentTarget: HTMLButtonElement }, metric: Metric, forecast = false)
   {
     if (event.pointerType !== 'mouse') return;
+    const anchor = event.currentTarget;
+    // Keyboard navigation can scroll another quota under a stationary mouse.
+    const focusedInfo = document.activeElement !== anchor && document.activeElement?.matches('.forecast-info:focus-visible');
     if (event.type === 'pointermove')
     {
-      if (!hoverBlocked) return;
+      if ((!hoverBlocked && !focusedInfo) || (!event.movementX && !event.movementY)) return;
       hoverBlocked = false;
     }
-    if (!hoverBlocked) hover(metric, event.currentTarget);
+    else if (focusedInfo) return;
+    if (hoverBlocked) return;
+    if (forecast) showForecast(metric, anchor);
+    else hover(metric, anchor);
   }
 
   function leave()
   {
     cancelTimers();
-    if (!pinned) closing = setTimeout(dismiss, 170);
+    if (!pinned && !(active?.forecast && active.anchor.matches(':focus-visible'))) closing = setTimeout(dismiss, 170);
   }
 
   function select(metric: Metric, anchor: HTMLButtonElement)
@@ -205,7 +216,21 @@
   {
     cancelTimers();
     pinned = false;
-    void open(metric, anchor, true);
+    if (active?.anchor !== anchor) void open(metric, anchor, true);
+  }
+
+  async function resetForecast(key: QuotaKey)
+  {
+    const id = JSON.stringify(key);
+    if (resetState[id] === 'pending') return;
+    dismiss();
+    resetState[id] = 'pending';
+    try
+    {
+      onUpdate(await backend.resetQuotaForecast(key));
+      delete resetState[id];
+    }
+    catch { resetState[id] = 'failed'; }
   }
 
   function dismiss()
@@ -242,6 +267,7 @@
 
 {#snippet windowRow(provider: ToolQuota, window: QuotaWindow)}
   {@const metric = windowMetric(provider, window)}
+  {@const resetting = resetState[JSON.stringify(metric.key)]}
   <div class="limits-window">
     <button class="limits-reading" type="button" aria-label={metric.label + ' · ' + metric.current}
       aria-controls="quota-history-card" aria-expanded={activeKey === JSON.stringify(metric.key)}
@@ -256,14 +282,23 @@
     </button>
     {#if window.minutes === 300 || window.minutes === 10080}
       <div class="limits-forecast">
-        <span>{forecastLabel(window, tracked[provider.tool], now)}</span>
+        <span aria-live="polite">{forecastLabel(window, tracked[provider.tool], now)}</span>
         <button class="quota-banked-info forecast-info" type="button"
           aria-label={metric.label + ' · ' + local('Usage this cycle', '本周期已用量')}
           aria-describedby={active?.forecast && active.metric.label === metric.label && active.metric.key.tool === provider.tool ? 'quota-history-card' : undefined}
-          onpointerenter={event => showForecast(metric, event.currentTarget)} onpointerleave={leave}
+          onpointerenter={event => pointerReading(event, metric, true)} onpointermove={event => pointerReading(event, metric, true)} onpointerleave={leave}
           onfocus={event => showForecast(metric, event.currentTarget)} onblur={leave}
           onclick={event => showForecast(metric, event.currentTarget)}>!</button>
+        {#if tracked[provider.tool]}
+          <button type="button" class="forecast-reset" disabled={resetting === 'pending'}
+            aria-label={[local('Reset forecast', '重置预测'), toolInfo(provider.tool).name, metric.label].join(' · ')}
+            title={local('Restart this forecast using new samples', '使用新样本重新预测此窗口')}
+            onclick={() => resetForecast(metric.key)}>
+            {resetting === 'pending' ? local('Resetting…', '重置中…') : local('Reset', '重置')}
+          </button>
+        {/if}
       </div>
+      {#if resetting === 'failed'}<p class="forecast-reset-error" role="alert">{local('Reset failed. Try again.', '重置失败，请重试。')}</p>{/if}
     {/if}
   </div>
 {/snippet}
@@ -326,11 +361,14 @@
       {/if}
       <small>{local('API-equivalent USD', 'API 等值美元')} ·
         {forecast.basis === 'history' ? local('Recent history', '近期历史参考') :
-          forecast.basis === 'current' ? local('Current cycle', '本期推算') : local('Collecting samples', '样本不足')}</small>
+          forecast.basis === 'current' ? local('Current cycle', '本期推算') : forecastLabel(activeWindow, tracked[active.metric.key.tool], now)}</small>
       {#if forecast.partial}<small>{local('Partial local records', '本机记录不完整')}</small>{/if}
       <small>{local('As of ', '截至 ')}{time(forecast.observedAt)}</small>
     {:else}
       {forecastLabel(activeWindow, tracked[active.metric.key.tool], now)}
+    {/if}
+    {#if activeWindow.forecastResetAt != null}
+      <small>{local('Forecast reset ', '预测重置于 ')}{time(activeWindow.forecastResetAt)}</small>
     {/if}
   {:else if visibleMetric}
     {#key JSON.stringify(visibleMetric.key)}

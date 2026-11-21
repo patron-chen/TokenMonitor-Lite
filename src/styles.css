@@ -301,6 +301,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .limits-forecast { display: flex; align-items: center; gap: 5px; margin-top: 3px; font: 0.5625rem/1.3 var(--mono); color: var(--muted); white-space: nowrap; }
 .forecast-info { anchor-name: none; position: relative; }
 .forecast-info::before { content: ""; position: absolute; inset: -3px; }
+.forecast-reset { flex: none; padding: 2px 4px; border-radius: 3px; color: var(--muted); font: 0.5625rem/1.2 var(--font); text-decoration: underline; text-underline-offset: 2px; }
+.forecast-reset:is(:hover, :focus-visible):enabled { color: var(--text); background: #ffffff12; }
+.forecast-reset-error { margin: 3px 0 0; color: #f5abb4; font-size: 0.625rem; }
 .limits-grid > :only-child { grid-column: 1 / -1; }
 .limits-reading { display: grid; gap: 5px; min-width: 0; padding: 1px 0 2px; border-radius: 4px; text-align: start; }
 .limits-reading:hover, .limits-reading[aria-expanded="true"] { background: #ffffff0c; }

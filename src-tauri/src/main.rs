@@ -308,6 +308,16 @@ fn record_banked_reset_panel(
 }
 
 #[tauri::command]
+async fn reset_quota_forecast(
+    quotas: State<'_, Arc<QuotaCache>>, store: State<'_, Arc<PreferencesStore>>, key: QuotaKey,
+) -> Result<Quotas, String>
+{
+    let tools = store.get().quotas.tools;
+    let quotas = quotas.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || quotas.reset_forecast(&key, tools)).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn get_quota_history(
     quotas: State<'_, Arc<QuotaCache>>, store: State<'_, Arc<PreferencesStore>>, key: QuotaKey,
 ) -> Result<HistoryPreview, String>
@@ -421,7 +431,7 @@ fn main()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| open(app, None)))
         .invoke_handler(tauri::generate_handler![
             details_ready, dismiss_window, get_view_state, remember_view, set_appearance, set_preferences, get_collection_status,
-            get_summary, get_activity, get_quotas, record_banked_reset_panel, get_quota_history,
+            get_summary, get_activity, get_quotas, record_banked_reset_panel, get_quota_history, reset_quota_forecast,
             list_sessions, get_session_detail, refresh
         ])
         .on_window_event(|window, event| {

@@ -5,7 +5,7 @@ const HOUR: i64 = 3_600_000;
 
 fn window(minutes: u64, end: i64) -> QuotaWindow
 {
-    QuotaWindow { group: String::new(), minutes: Some(minutes), remaining: 80.0, resets_at: Some(end), forecast: None }
+    QuotaWindow { group: String::new(), minutes: Some(minutes), remaining: 80.0, resets_at: Some(end), forecast_reset_at: None, forecast: None }
 }
 
 fn reading(at: i64, remaining: f64, end: i64) -> Reading
@@ -109,6 +109,101 @@ fn groups_unknown_models_and_account_boundaries_are_isolated()
         quota_history::store_profile(&db, "codex", at, plan, account).unwrap();
         assert_eq!(scope_start(&db, "codex", 0).unwrap(), match at { 1 | 2 => 0, 3 | 4 => 3, _ => 5 });
     }
+}
+
+#[test]
+fn manual_reset_relearns_from_new_pairs_and_keeps_all_cycle_usage()
+{
+    let end = T + 5 * HOUR;
+    let mut selected = window(300, end);
+    selected.forecast_reset_at = Some(T + 2000);
+    let points = [reading(T - 4 * HOUR, 80.0, T), reading(T - 3 * HOUR, 70.0, T),
+        reading(T, 90.0, end), reading(T + 1000, 80.0, end), reading(T + 3000, 60.0, end),
+        reading(T + 4000, 58.0, end), reading(T + 5000, 55.0, end)];
+    let mut data = ledger(vec![request(T - 3 * HOUR, 50_000, 0.5),
+        (T + 700, Amount { tokens: 90_000, usd: None, missing: true }),
+        request(T + 2500, 30_000, 0.3), request(T + 4000, 2000, 0.04), request(T + 5000, 3000, 0.06)], T + 4000);
+    let early = estimate(&selected, data.through, &points, &data, data.through).unwrap();
+    assert_eq!((early.basis, early.total_tokens, early.used_tokens), ("insufficient", None, Some(122_000)));
+    data.through = T + 5000;
+    let ready = estimate(&selected, data.through, &points, &data, data.through).unwrap();
+    assert_eq!((ready.basis, ready.used_tokens, ready.total_tokens), ("current", Some(125_000), Some(100_000)));
+    assert!(ready.missing_price && (ready.used_usd.unwrap() - 0.4).abs() < 1e-9);
+    assert!((ready.total_usd.unwrap() - 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn reset_persists_for_only_the_selected_tool_group_and_duration()
+{
+    use crate::{quota::{Providers, QuotaCache, Quotas}, settings::QuotaSettings};
+    use std::fs;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let root = std::env::temp_dir().join(format!("lite-forecast-reset-{}-{now}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let tools = ToolSelection { codex: true, antigravity: true, dsh: false };
+    let db = QuotaHistory::new(&root).connection().unwrap();
+    db.execute_batch(index::SCHEMA).unwrap();
+    for (tool, model) in [("codex", "gpt"), ("antigravity", "gemini-pro"), ("antigravity", "claude-opus")]
+    {
+        db.execute("INSERT OR REPLACE INTO forecast_scans VALUES (?1,?2)", params![tool,now]).unwrap();
+        db.execute("INSERT INTO forecast_requests VALUES (?1,'test',?2,?3,?2,1000,1,0)", params![tool,model,now-1000]).unwrap();
+    }
+    let refresh = |cache: &QuotaCache| {
+        let provider = |tool, groups: &[&str]| {
+            let mut windows = Vec::new();
+            for group in groups
+            {
+                for minutes in [300, 10_080]
+                {
+                    let mut w = window(minutes, now + HOUR);
+                    w.group = (*group).to_owned();
+                    windows.push(w);
+                }
+            }
+            ToolQuota { tool, plan: None, account: None, observed_at: now, windows, balances: vec![], banked_reset: None }
+        };
+        let codex = provider("codex", &[""]);
+        let ag = provider("antigravity", &["Gemini", "Claude/GPT"]);
+        let mut samples = Vec::new();
+        for mut baseline in [codex.clone(), ag.clone()]
+        {
+            baseline.observed_at = now - 2000;
+            for w in &mut baseline.windows { w.remaining += 10.0; }
+            baseline.samples(&mut samples);
+        }
+        cache.refresh(QuotaSettings { tools, ..QuotaSettings::default() }, true,
+            || (Some(codex), Providers { antigravity: Some(ag), ..Providers::default() }, samples))
+    };
+    let check = |snapshot: &Quotas, after_reset| {
+        assert_eq!(snapshot.tools.iter().map(|p| p.windows.len()).sum::<usize>(), 6);
+        for p in &snapshot.tools
+        {
+            for w in &p.windows
+            {
+                let selected = after_reset && p.tool == "antigravity" && w.group == "Gemini" && w.minutes == Some(10_080);
+                let f = w.forecast.as_ref().unwrap();
+                assert_eq!(w.forecast_reset_at.is_some(), selected);
+                assert_eq!((f.used_tokens, f.used_usd), (Some(1000), Some(1.0)));
+                assert_eq!((f.total_tokens, f.total_usd), ((!selected).then_some(10_000), (!selected).then_some(10.0)));
+            }
+        }
+    };
+    let key = QuotaKey::Window { tool: "antigravity".into(), group: "Gemini".into(), minutes: Some(10_080) };
+    let cache = QuotaCache::new(&root);
+    check(&refresh(&cache), false);
+    let history = quota_history::read(&db, &key, now).unwrap();
+    check(&cache.reset_forecast(&key, tools).unwrap(), true);
+    check(&cache.cached(tools).unwrap(), true);
+    check(&refresh(&QuotaCache::new(&root)), true);
+    let after = quota_history::read(&db, &key, now).unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().map(|p| (p.at, p.value, p.reset_at)).eq(after.iter().map(|p| (p.at, p.value, p.reset_at))));
+    drop(db);
+    fs::remove_file(root.join("quota-history.sqlite")).unwrap();
+    fs::remove_file(root.join("logs/codex-banked-reset.log")).unwrap();
+    fs::remove_dir(root.join("logs")).unwrap();
+    fs::remove_dir(root).unwrap();
 }
 
 #[test]

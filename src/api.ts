@@ -85,6 +85,7 @@ export interface QuotaWindow
   minutes: number | null;
   remaining: number;
   resetsAt: number | null;
+  forecastResetAt?: number;
   forecast?: QuotaForecast;
 }
 
@@ -248,6 +249,7 @@ export const backend = {
   bankedResetPanel: (limitsView: boolean, codexEnabled: boolean, readFailed: boolean, count: number | null, rendered: boolean) =>
     invoke<void>('record_banked_reset_panel', { limitsView, codexEnabled, readFailed, count, rendered }),
   quotaHistory: (key: QuotaKey) => invoke<QuotaHistory>('get_quota_history', { key }),
+  resetQuotaForecast: (key: QuotaKey) => invoke<Quotas>('reset_quota_forecast', { key }),
   forecastUpdated: (callback: (snapshot: Quotas) => void) =>
     listen<Quotas>('quota-forecast-updated', event => callback(event.payload)),
   sessions: (period: Period, tool: string | null, query: string, page: number, preview: boolean) =>

@@ -49,7 +49,10 @@ export function forecastLabel(window: QuotaWindow, tracked: boolean, now: number
   if (!tracked) return local('Usage tracking off', '未启用用量采集');
   if (!window.resetsAt || window.resetsAt <= now) return local('Awaiting update', '等待额度更新');
   const value = window.forecast;
-  if (!value || value.totalTokens == null) return local('Collecting samples', '样本不足');
+  if (!value || value.totalTokens == null)
+  {
+    return window.forecastResetAt != null ? local('Collecting new samples', '重新采样中') : local('Collecting samples', '样本不足');
+  }
   const prefix = value.basis === 'history' ? local('Hist. ≈', '历史约 ') : local('Est. ', '预计 ');
   const usd = value.totalUsd == null ? local('unpriced', '缺价') : apiDollars(value.totalUsd);
   return prefix + compact(value.totalTokens) + ' Token · ' + usd;

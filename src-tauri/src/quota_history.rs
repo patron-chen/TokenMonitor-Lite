@@ -50,7 +50,7 @@ impl QuotaKey
         }
     }
 
-    fn identity(&self) -> String
+    pub(crate) fn identity(&self) -> String
     {
         // JSON keeps provider, model group, duration and currency unambiguous.
         serde_json::to_string(self).expect("quota identity")

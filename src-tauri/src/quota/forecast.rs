@@ -170,7 +170,10 @@ fn estimate(window: &QuotaWindow, observed: i64, readings: &[Reading], ledger: &
     let mut current = Calibration::default();
     let mut historical = Calibration::default();
     let mut anchor: Option<Reading> = None;
-    for &point in readings.iter().filter(|p| p.at >= ledger.since && p.at <= ledger.through && p.at <= observed)
+    // A manual reset starts a new calibration at the next observed reading, even across cycles.
+    // Cycle usage still includes all locally recorded requests since the actual quota reset.
+    let calibration_start = window.forecast_reset_at.unwrap_or(ledger.since).max(ledger.since);
+    for &point in readings.iter().filter(|p| p.at >= calibration_start && p.at <= ledger.through && p.at <= observed)
     {
         let Some(reset) = point.reset_at.filter(|reset| point.at < *reset && point.at >= reset - duration) else
         {
@@ -222,7 +225,12 @@ fn estimate(window: &QuotaWindow, observed: i64, readings: &[Reading], ledger: &
         let factor = 100.0 / calibration.points;
         result.basis = basis;
         result.total_tokens = Some((calibration.amount.tokens as f64 * factor).round() as u64);
-        if !used.missing && !calibration.amount.missing { result.total_usd = calibration.amount.usd.map(|usd| usd * factor); }
+        let missing_price = if used.missing && calibration_start > start.max(ledger.since)
+        {
+            ledger.amount(&window.group, calibration_start, through).0.missing
+        }
+        else { used.missing };
+        if !missing_price && !calibration.amount.missing { result.total_usd = calibration.amount.usd.map(|usd| usd * factor); }
     }
     Some(result)
 }
@@ -233,6 +241,7 @@ pub(super) fn attach(history: &QuotaHistory, providers: &mut [ToolQuota], tools:
         let mut db = history.connection()?;
         db.execute_batch(index::SCHEMA)?;
         let tx = db.transaction()?;
+        let mut resets = tx.prepare("SELECT at FROM forecast_resets WHERE series=?1 AND at>=?2")?;
         for provider in providers.iter_mut().filter(|p| tools.contains(p.tool) && !p.windows.is_empty())
         {
             let ledger = Ledger::load(&tx, provider, now)?;
@@ -240,14 +249,31 @@ pub(super) fn attach(history: &QuotaHistory, providers: &mut [ToolQuota], tools:
             {
                 window.forecast = None;
                 if !matches!(window.minutes, Some(300 | 10_080)) { continue; }
-                let Some(ledger) = &ledger else { continue };
                 let key = QuotaKey::Window { tool: provider.tool.into(), group: window.group.clone(), minutes: window.minutes };
+                window.forecast_reset_at = resets.query_row(params![key.identity(), now - RETENTION_MS], |row| row.get(0)).optional()?;
+                let Some(ledger) = &ledger else { continue };
                 window.forecast = estimate(window, provider.observed_at, &quota_history::read(&tx, &key, now)?, ledger, now);
             }
         }
         Ok(())
     };
     if let Err(error) = load() { eprintln!("Could not read quota forecasts: {error}"); }
+}
+
+pub(super) fn reset(history: &QuotaHistory, key: &QuotaKey, window: &mut QuotaWindow, now: i64) -> rusqlite::Result<()>
+{
+    let db = history.connection()?;
+    db.execute_batch(index::SCHEMA)?;
+    db.execute("INSERT INTO forecast_resets (series,at) VALUES (?1,?2)
+        ON CONFLICT(series) DO UPDATE SET at=excluded.at", params![key.identity(), now])?;
+    window.forecast_reset_at = Some(now);
+    if let Some(forecast) = &mut window.forecast
+    {
+        forecast.basis = "insufficient";
+        forecast.total_tokens = None;
+        forecast.total_usd = None;
+    }
+    Ok(())
 }
 
 pub(super) fn observe_account(history: &QuotaHistory, sources: &Sources, now: i64)
@@ -279,7 +305,7 @@ pub(super) fn sync(
     let plan = db.query_row("SELECT plan FROM quota_profiles WHERE tool=?1 AND at<=?2 AND plan IS NOT NULL ORDER BY at DESC LIMIT 1",
         params![tool, at], |row| row.get(0)).optional()?;
     let windows = latest.into_iter().filter(|(_, r)| r.at == at).map(|(minutes, r)| QuotaWindow {
-        group: String::new(), minutes: Some(minutes), remaining: r.value, resets_at: r.reset_at, forecast: None,
+        group: String::new(), minutes: Some(minutes), remaining: r.value, resets_at: r.reset_at, forecast_reset_at: None, forecast: None,
     }).collect();
     Ok(Some(ToolQuota { tool: "codex", plan, account: None, observed_at: at, windows, balances: vec![], banked_reset: None }))
 }
