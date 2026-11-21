@@ -363,6 +363,11 @@
       <small>{local('API-equivalent USD', 'API 等值美元')} ·
         {forecast.basis === 'history' ? local('Recent history', '近期历史参考') :
           forecast.basis === 'current' ? local('Current cycle', '本期推算') : forecastLabel(activeWindow, tracked[active.metric.key.tool], now)}</small>
+      {#if forecast.totalTokens != null}
+        <small>{forecast.modelMixRequests
+          ? local(`Model mix · last ${forecast.modelMixRequests} calls`, `按最近 ${forecast.modelMixRequests} 次调用的模型组合`)
+          : local('Window average', '按窗口平均用量')}</small>
+      {/if}
       {#if forecast.partial}<small>{local('Partial local records', '本机记录不完整')}</small>{/if}
       <small>{local('As of ', '截至 ')}{time(forecast.observedAt)}</small>
     {:else}

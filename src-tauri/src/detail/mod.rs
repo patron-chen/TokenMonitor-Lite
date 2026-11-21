@@ -63,6 +63,8 @@ struct Turn
     #[serde(skip)]
     response_id: Option<String>,
     #[serde(skip)]
+    service_tier: Option<String>,
+    #[serde(skip)]
     reasoning_exposed: bool,
 }
 
@@ -72,7 +74,7 @@ impl Turn
     {
         Self {
             at, model, tools, counts, tokens: counts.total(), kind, reasoning_effort: None,
-            performance: None, timing: None, response_id: None, reasoning_exposed: false,
+            performance: None, timing: None, response_id: None, service_tier: None, reasoning_exposed: false,
         }
     }
 
@@ -97,6 +99,7 @@ pub(crate) struct MeteredRequest
 {
     pub at: i64,
     pub model: Option<String>,
+    pub service_tier: Option<String>,
     pub id: Option<String>,
     pub counts: TokenCounts,
 }
@@ -149,7 +152,9 @@ impl Conversation
             let Some(at) = turn.at else { meter.partial = true; return };
             if at >= meter.since
             {
-                meter.requests.push(MeteredRequest { at, model: turn.model, id: turn.response_id, counts: turn.counts });
+                meter.requests.push(MeteredRequest {
+                    at, model: turn.model, service_tier: turn.service_tier, id: turn.response_id, counts: turn.counts,
+                });
             }
             return;
         }

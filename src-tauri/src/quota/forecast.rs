@@ -1,4 +1,5 @@
 mod index;
+mod weights;
 #[cfg(test)]
 mod tests;
 
@@ -12,6 +13,7 @@ use crate::{
     settings::ToolSelection, sources::Sources,
 };
 use super::{QuotaWindow, ToolQuota};
+use weights::{Calibration, Models, Request, Validation, Workload, RECENT_REQUESTS};
 
 const MIN_POINTS: f64 = 5.0;
 
@@ -27,6 +29,7 @@ pub(super) struct Forecast
     partial: bool,
     total_tokens: Option<u64>,
     total_usd: Option<f64>,
+    model_mix_requests: Option<usize>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -48,16 +51,9 @@ impl Amount
 }
 
 #[derive(Default)]
-struct Calibration
-{
-    amount: Amount,
-    points: f64,
-}
-
-#[derive(Default)]
 struct Ledger
 {
-    groups: HashMap<String, Vec<(i64, Amount)>>,
+    groups: HashMap<String, Vec<Request>>,
     gaps: Vec<(i64, i64)>,
     since: i64,
     through: i64,
@@ -105,18 +101,22 @@ impl Ledger
         let mut ledger = Self { since, through, ..Self::default() };
         let groups: Vec<_> = provider.windows.iter().map(|window| window.group.clone()).collect();
         let mut seen = HashSet::new();
-        let mut query = db.prepare("SELECT event,at,model,tokens,usd,missing FROM forecast_requests
-            WHERE tool=?1 AND at BETWEEN ?2 AND ?3 ORDER BY at,path")?;
+        let mut models = Models::default();
+        let mut query = db.prepare("SELECT r.event,r.at,r.model,r.tokens,r.usd,r.missing,t.tier FROM forecast_requests r
+            LEFT JOIN forecast_request_tiers t USING(tool,path,event)
+            WHERE r.tool=?1 AND r.at BETWEEN ?2 AND ?3 ORDER BY r.at,t.tier IS NULL,r.path,r.event")?;
         let mut rows = query.query(params![tool, since, through])?;
         while let Some(row) = rows.next()?
         {
             if !seen.insert(row.get::<_, String>(0)?) { continue; }
             let at = row.get(1)?;
-            if let Some(group) = model_group(tool, &row.get::<_, String>(2)?, &groups)
+            let model: String = row.get(2)?;
+            if let Some(group) = model_group(tool, &model, &groups)
             {
-                ledger.groups.entry(group.to_owned()).or_default().push((at, Amount {
-                    tokens: row.get(3)?, usd: row.get(4)?, missing: row.get(5)?,
-                }));
+                let tier: Option<String> = row.get(6)?;
+                let (model, speed_factor) = models.identify(tool, &model, tier.as_deref());
+                let amount = Amount { tokens: row.get(3)?, usd: row.get(4)?, missing: row.get(5)? };
+                ledger.groups.entry(group.to_owned()).or_default().push(Request { at, amount, model, speed_factor });
             }
             else { ledger.gaps.push((at, at)); }
         }
@@ -137,17 +137,19 @@ impl Ledger
         Ok(Some(ledger))
     }
 
-    fn amount(&self, group: &str, start: i64, end: i64) -> (Amount, bool)
+    fn events(&self, group: &str, start: i64, end: i64) -> &[Request]
     {
-        let mut amount = Amount::default();
-        if let Some(events) = self.groups.get(group)
-        {
-            let first = events.partition_point(|(at, _)| *at < start);
-            for (_, item) in events[first..].iter().take_while(|(at, _)| *at <= end) { amount.add(*item); }
-        }
+        let Some(events) = self.groups.get(group) else { return &[] };
+        if start > end { return &[]; }
+        let first = events.partition_point(|event| event.at < start);
+        let last = events.partition_point(|event| event.at <= end);
+        &events[first..last]
+    }
+
+    fn has_gap(&self, start: i64, end: i64) -> bool
+    {
         let first_gap = self.gaps.partition_point(|(_, right)| *right < start);
-        let partial = self.gaps.get(first_gap).is_some_and(|(left, _)| *left <= end);
-        (amount, partial)
+        start <= end && self.gaps.get(first_gap).is_some_and(|(left, _)| *left <= end)
     }
 }
 
@@ -169,6 +171,7 @@ fn estimate(window: &QuotaWindow, observed: i64, readings: &[Reading], ledger: &
     }
     let mut current = Calibration::default();
     let mut historical = Calibration::default();
+    let mut validation = Validation::default();
     let mut anchor: Option<Reading> = None;
     // A manual reset starts a new calibration at the next observed reading, even across cycles.
     // Cycle usage still includes all locally recorded requests since the actual quota reset.
@@ -202,36 +205,65 @@ fn estimate(window: &QuotaWindow, observed: i64, readings: &[Reading], ledger: &
         else { continue };
         let drop = prior.value - point.value;
         if drop <= 0.0 || first > point.at { continue; }
-        let target = if same_reset(reset, end) && first >= start { &mut current }
-            else if point.at < start { &mut historical } else { continue };
-        let (amount, gap) = ledger.amount(&window.group, first, point.at);
-        if !gap && amount.tokens > 0
+        if ledger.has_gap(first, point.at) { continue; }
+        let work = Workload::from_requests(ledger.events(&window.group, first, point.at).iter());
+        if work.calls == 0 { continue; }
+        if same_reset(reset, end) && first >= start
         {
-            target.points += drop;
-            target.amount.add(amount);
+            validation.compare(&work, drop, &current, &historical);
+            current.observe(&work, drop);
+        }
+        else if point.at < start
+        {
+            validation.compare(&work, drop, &historical, &Calibration::default());
+            historical.observe(&work, drop);
         }
     }
     let through = ledger.through.min(now);
-    let (used, gap) = ledger.amount(&window.group, start.max(ledger.since), through);
-    let calibration = if current.points + 1e-9 >= MIN_POINTS { Some(("current", current)) }
-        else if historical.points + 1e-9 >= MIN_POINTS { Some(("history", historical)) } else { None };
+    let cycle_start = start.max(ledger.since);
+    let events = ledger.events(&window.group, cycle_start, through);
+    let mut used = Amount::default();
+    for event in events { used.add(event.amount); }
+    let gap = ledger.has_gap(cycle_start, through);
+    let calibration = if current.points + 1e-9 >= MIN_POINTS { Some(("current", &current)) }
+        else if historical.points + 1e-9 >= MIN_POINTS { Some(("history", &historical)) } else { None };
     let mut result = Forecast {
         basis: "insufficient", observed_at: through, used_tokens: (through >= start).then_some(used.tokens),
         used_usd: used.usd.or_else(|| (!used.missing && through >= start).then_some(0.0)), missing_price: used.missing,
-        partial: gap || ledger.since > start, total_tokens: None, total_usd: None,
+        partial: gap || ledger.since > start, total_tokens: None, total_usd: None, model_mix_requests: None,
     };
-    if let Some((basis, calibration)) = calibration
+    let Some((basis, calibration)) = calibration else { return Some(result) };
+    let factor = 100.0 / calibration.points;
+    result.basis = basis;
+    result.total_tokens = Some((calibration.amount.tokens as f64 * factor).round() as u64);
+    let missing_price = events.iter().any(|r| r.at >= calibration_start && r.billable() && r.amount.missing);
+    if !missing_price && !calibration.amount.missing
     {
-        let factor = 100.0 / calibration.points;
-        result.basis = basis;
-        result.total_tokens = Some((calibration.amount.tokens as f64 * factor).round() as u64);
-        let missing_price = if used.missing && calibration_start > start.max(ledger.since)
-        {
-            ledger.amount(&window.group, calibration_start, through).0.missing
-        }
-        else { used.missing };
-        if !missing_price && !calibration.amount.missing { result.total_usd = calibration.amount.usd.map(|usd| usd * factor); }
+        result.total_usd = calibration.amount.usd.map(|usd| usd * factor);
     }
+    if !validation.accepted() { return Some(result); }
+    let as_of = observed.min(through);
+    let recent = Workload::from_requests(ledger.events(&window.group, cycle_start.max(calibration_start), as_of)
+        .iter().rev().filter(|r| r.billable()).take(RECENT_REQUESTS));
+    if recent.calls < 3 || recent.oldest.is_none_or(|at| ledger.has_gap(at, as_of)) { return Some(result); }
+    let Some(points) = current.predict_points(&historical, &recent) else { return Some(result) };
+
+    // Only fill unobserved spend at the window average. Apply the recent mix to the remaining allowance.
+    let remaining = window.remaining.clamp(0.0, 100.0);
+    let uncovered = (100.0 - remaining - current.points).max(0.0) / calibration.points;
+    let mut recorded = Amount::default();
+    for r in events.iter().take_while(|r| r.at <= as_of).filter(|r| r.billable()) { recorded.add(r.amount); }
+    let past_tokens = current.amount.tokens as f64 + uncovered * calibration.amount.tokens as f64;
+    let future = remaining / points;
+    result.total_tokens = Some((past_tokens.max(recorded.tokens as f64) + future * recent.amount.tokens as f64).round() as u64);
+    if result.total_usd.is_some()
+    {
+        result.total_usd = calibration.amount.usd.zip(recent.amount.usd).map(|(cost, recent_cost)| {
+            let past = current.amount.usd.unwrap_or(0.0) + uncovered * cost;
+            past.max(recorded.usd.unwrap_or(0.0)) + future * recent_cost
+        });
+    }
+    result.model_mix_requests = Some(recent.calls);
     Some(result)
 }
 
@@ -272,6 +304,7 @@ pub(super) fn reset(history: &QuotaHistory, key: &QuotaKey, window: &mut QuotaWi
         forecast.basis = "insufficient";
         forecast.total_tokens = None;
         forecast.total_usd = None;
+        forecast.model_mix_requests = None;
     }
     Ok(())
 }

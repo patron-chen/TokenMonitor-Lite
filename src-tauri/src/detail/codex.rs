@@ -138,6 +138,7 @@ struct Parser<'a>
     span: &'a Span,
     conversation: &'a mut Conversation,
     model: Option<String>,
+    service_tier: Option<String>,
     effort: Option<String>,
     session: Option<String>,
     fork_prefix: bool,
@@ -155,7 +156,7 @@ impl<'a> Parser<'a>
     fn new(span: &'a Span, conversation: &'a mut Conversation) -> Self
     {
         Self {
-            span, conversation, model: None, effort: None, session: None, fork_prefix: false,
+            span, conversation, model: None, service_tier: None, effort: None, session: None, fork_prefix: false,
             tools: Vec::new(), latest_total: None, clock: RequestClock::default(), pending: None,
             response_ids: HashSet::new(), previous_prompt: None, other_pool: false,
         }
@@ -187,6 +188,8 @@ impl<'a> Parser<'a>
                 self.flush_pending();
                 self.fork_prefix = false;
                 self.model = model(payload).or_else(|| self.model.clone());
+                // An omitted tier is unknown for this turn, even if the previous turn used Fast.
+                self.service_tier = service_tier(payload);
                 self.effort = text(payload.get("effort").unwrap_or(&payload["reasoning_effort"])).and_then(reasoning_effort);
                 self.clock.start_turn(at);
             }
@@ -213,6 +216,7 @@ impl<'a> Parser<'a>
                     let timing = self.clock.finish(at, counts.reasoning.unwrap_or(0), true);
                     let mut turn = Turn::new(at, model, std::mem::take(&mut self.tools), counts, "reply").with_timing(timing);
                     turn.reasoning_effort.clone_from(&self.effort);
+                    turn.service_tier = service_tier(payload).or_else(|| self.service_tier.clone());
                     turn.response_id = text(&payload["response_id"]).map(str::to_owned);
                     turn.reasoning_exposed = reasoning_exposed;
                     self.pending = Some(Pending { turn, usage: raw });
@@ -306,6 +310,7 @@ impl<'a> Parser<'a>
         let candidate = self.pending.take();
         let mut model = model(payload).or_else(|| self.model.clone());
         let mut effort = self.effort.clone();
+        let mut tier = service_tier(payload);
         let mut tools = std::mem::take(&mut self.tools);
         let mut response_id = None;
         let reasoning_exposed;
@@ -317,6 +322,7 @@ impl<'a> Parser<'a>
             }
             model = pending.turn.model.or(model);
             effort = pending.turn.reasoning_effort.or(effort);
+            tier = tier.or(pending.turn.service_tier);
             for name in pending.turn.tools { add_tool(&mut tools, Some(&name)); }
             self.clock.last_count = self.clock.last_count.max(at);
             reasoning_exposed = pending.turn.reasoning_exposed;
@@ -335,6 +341,7 @@ impl<'a> Parser<'a>
         };
         let mut turn = Turn::new(at, model, tools, counts, "reply").with_timing(timing);
         turn.reasoning_effort = effort;
+        turn.service_tier = tier.or_else(|| self.service_tier.clone());
         turn.response_id = response_id;
         turn.reasoning_exposed = reasoning_exposed;
         if !self.other_pool || self.conversation.metering.is_none()
@@ -360,6 +367,12 @@ fn model(payload: &Value) -> Option<String>
 {
     text(&payload["model"]).or_else(|| text(&payload["response_model"]))
         .or_else(|| text(&payload["model_slug"])).map(str::to_owned)
+}
+
+fn service_tier(payload: &Value) -> Option<String>
+{
+    text(&payload["service_tier"]).or_else(|| text(&payload["usage"]["service_tier"]))
+        .or_else(|| text(&payload["info"]["service_tier"])).map(str::to_ascii_lowercase)
 }
 
 fn raw_usage(value: &Value) -> Option<[u64; 4]>

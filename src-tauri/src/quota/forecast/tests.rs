@@ -16,12 +16,17 @@ fn reading(at: i64, remaining: f64, end: i64) -> Reading
     Reading { at, value: remaining, reset_at: Some(end) }
 }
 
-fn request(at: i64, tokens: u64, usd: f64) -> (i64, Amount)
+fn request(at: i64, tokens: u64, usd: f64) -> Request
 {
-    (at, Amount { tokens, usd: Some(usd), missing: false })
+    Request { at, amount: Amount { tokens, usd: Some(usd), missing: false }, model: None, speed_factor: 1.0 }
 }
 
-fn ledger(events: Vec<(i64, Amount)>, through: i64) -> Ledger
+fn unpriced(at: i64, tokens: u64) -> Request
+{
+    Request { amount: Amount { tokens, usd: None, missing: true }, ..request(at, tokens, 0.0) }
+}
+
+fn ledger(events: Vec<Request>, through: i64) -> Ledger
 {
     Ledger { since: T - RETENTION_MS, through, groups: HashMap::from([(String::new(), events)]), gaps: vec![] }
 }
@@ -69,7 +74,7 @@ fn floating_full_windows_missing_prices_gaps_and_refills_are_distinct()
     let end = T + 5 * HOUR;
     let rows = [reading(T - 4000, 100.0, end - 4000), reading(T - 2000, 100.0, end - 2000),
         reading(T + 2000, 93.0, end), reading(T + 3000, 100.0, end), reading(T + 4000, 90.0, end)];
-    let mut data = ledger(vec![(T, Amount { tokens: 7000, usd: None, missing: true }), request(T+4000, 1200, 0.2)], T+2000);
+    let mut data = ledger(vec![unpriced(T, 7000), request(T+4000, 1200, 0.2)], T+2000);
     let first = estimate(&window(300, end), rows[2].at, &rows, &data, data.through).unwrap();
     assert_eq!((first.total_tokens, first.total_usd, first.used_usd, first.missing_price), (Some(100_000), None, None, true));
     data.through += 2000;
@@ -124,7 +129,7 @@ fn manual_reset_relearns_from_new_pairs_and_keeps_all_cycle_usage()
         reading(T, 90.0, end), reading(T + 1000, 80.0, end), reading(T + 3000, 60.0, end),
         reading(T + 4000, 58.0, end), reading(T + 5000, 55.0, end)];
     let mut data = ledger(vec![request(T - 3 * HOUR, 50_000, 0.5),
-        (T + 700, Amount { tokens: 90_000, usd: None, missing: true }),
+        unpriced(T + 700, 90_000),
         request(T + 2500, 30_000, 0.3), request(T + 4000, 2000, 0.04), request(T + 5000, 3000, 0.06)], T + 4000);
     let early = estimate(&selected, data.through, &points, &data, data.through).unwrap();
     assert_eq!((early.basis, early.total_tokens, early.used_tokens), ("insufficient", None, Some(122_000)));
@@ -234,11 +239,14 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
         "primary":{"window_minutes":300,"used_percent":five,"resets_at":at+4*HOUR},
         "secondary":{"window_minutes":10080,"used_percent":week,"resets_at":at+72*HOUR}});
     let lines = [
-        json!({"type":"turn_context","timestamp":at,"payload":{"model":"gpt-5.4"}}),
+        json!({"type":"turn_context","timestamp":at,"payload":{"model":"gpt-5.4","service_tier":"priority"}}),
         json!({"type":"event_msg","timestamp":at,"payload":{"type":"token_count","rate_limits":limits(5,10)}}),
-        json!({"type":"token_usage_record","timestamp":at+500,"payload":{"response_id":"forecast-response","usage":usage}}),
-        json!({"type":"event_msg","timestamp":at+500,"payload":{"type":"token_count","rate_limits":limits(15,15),
+        json!({"type":"token_usage_record","timestamp":at+500,"payload":{"response_id":"forecast-response","service_tier":"ultrafast","usage":usage}}),
+        json!({"type":"event_msg","timestamp":at+500,"payload":{"type":"token_count","rate_limits":limits(5,10),
             "info":{"total_token_usage":usage,"last_token_usage":usage}}}),
+        json!({"type":"turn_context","timestamp":at+600,"payload":{"model":"gpt-5.4"}}),
+        json!({"type":"token_usage_record","timestamp":at+700,"payload":{"response_id":"next-response","usage":usage}}),
+        json!({"type":"event_msg","timestamp":at+800,"payload":{"type":"token_count","rate_limits":limits(15,15)}}),
     ].map(|row| row.to_string()).join("\n");
     fs::write(&archived, zstd::stream::encode_all(lines.as_bytes(), 1).unwrap()).unwrap();
     let tools = ToolSelection { codex: true, antigravity: false, dsh: false };
@@ -251,10 +259,15 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
         let snapshot = cache.read(&sources, settings, true);
         let values = &snapshot.tools[0].windows;
         assert_eq!(values.len(), 2);
+        let db = QuotaHistory::new(&root).connection().unwrap();
+        let tiers: (usize, usize) = db.query_row("SELECT COUNT(*),COUNT(CASE WHEN tier='ultrafast' THEN 1 END)
+            FROM forecast_request_tiers", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let copies = if pass == 2 { 2 } else { 1 };
+        assert_eq!(tiers, (copies, copies)); // The next turn did not specify a tier.
         for (row, factor) in values.iter().zip([10,20])
         {
             let f = row.forecast.as_ref().unwrap();
-            assert_eq!((f.basis, f.used_tokens, f.total_tokens), ("current", Some(200_000), Some(200_000 * factor)));
+            assert_eq!((f.basis, f.used_tokens, f.total_tokens), ("current", Some(400_000), Some(400_000 * factor)));
             assert!(f.used_usd.unwrap() > 0.0 && (f.total_usd.unwrap() - f.used_usd.unwrap() * factor as f64).abs() < 1e-9);
         }
     }
@@ -267,4 +280,118 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
     fs::remove_dir(archive).unwrap();
     fs::remove_dir(sources.codex_root()).unwrap();
     fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn recent_model_mix_projects_only_remaining_quota_in_either_window()
+{
+    for minutes in [300, 10_080]
+    {
+        let duration = minutes as i64 * 60_000;
+        let old = T - duration;
+        let end = T + duration;
+        let mut rows = vec![reading(old, 100.0, T)];
+        let mut history = Vec::new();
+        // Model A gets 200 raw tokens per quota point, model B gets 40.
+        for (i, model) in [0, 1, 0, 1, 0, 1, 0].into_iter().enumerate()
+        {
+            let time = old + (i + 1) as i64;
+            let tokens = if model == 0 { 1000 } else { 200 };
+            history.push(Request { model: Some(model), ..request(time, tokens, tokens as f64 / 1000.0) });
+            rows.push(reading(time, 95.0 - 5.0 * i as f64, T));
+        }
+        rows.push(reading(T, 100.0, end));
+        for (model, remaining, total) in [(0, 99.0, 20_000), (1, 95.0, 4000)]
+        {
+            let now = T + 20;
+            let mut events = history.clone();
+            for time in T + 1..=now
+            {
+                events.push(Request { model: Some(model), ..request(time, 10, 0.01) });
+            }
+            let mut points = rows.clone();
+            points.push(reading(now, remaining, end));
+            let mut selected = window(minutes, end);
+            selected.remaining = remaining;
+            let mut data = ledger(events, now);
+            let forecast = estimate(&selected, now, &points, &data, now).unwrap();
+            assert_eq!((forecast.used_tokens, forecast.total_tokens, forecast.model_mix_requests),
+                (Some(200), Some(total), Some(20)));
+            assert!((forecast.total_usd.unwrap() - total as f64 / 1000.0).abs() < 1e-8);
+
+            // A new model and a manual reset each independently invalidate the learned mix.
+            data.groups.get_mut("").unwrap().last_mut().unwrap().model = Some(2);
+            let unknown = estimate(&selected, now, &points, &data, now).unwrap();
+            assert!(unknown.total_tokens.is_some() && unknown.model_mix_requests.is_none());
+            data.groups.get_mut("").unwrap().last_mut().unwrap().model = Some(model);
+            selected.forecast_reset_at = Some(T);
+            assert!(estimate(&selected, now, &points, &data, now).unwrap().model_mix_requests.is_none());
+        }
+
+        let mut events = history;
+        events.push(Request { model: Some(0), ..request(T + 1, 1000, 1.0) });
+        for time in T + 2..=T + 21
+        {
+            events.push(Request { model: Some(1), ..request(time, 10, 0.01) });
+        }
+        rows.extend([reading(T + 1, 95.0, end), reading(T + 21, 90.0, end)]);
+        let mut selected = window(minutes, end);
+        selected.remaining = 90.0;
+        let data = ledger(events, T + 21);
+        let switched = estimate(&selected, data.through, &rows, &data, data.through).unwrap();
+        // The first 1000 tokens retain their measured spend; the last 20 calls price the remaining 90 points.
+        assert_eq!((switched.used_tokens, switched.total_tokens, switched.model_mix_requests),
+            (Some(1200), Some(4800), Some(20)));
+        assert!((switched.total_usd.unwrap() - 4.8).abs() < 1e-8);
+    }
+}
+
+#[test]
+fn only_documented_tiers_share_a_rate_and_only_codex_auto_review_is_free()
+{
+    let mut models = Models::default();
+    let (model, standard) = models.identify("codex", "gpt-6.2-astra", Some("standard"));
+    assert_eq!(standard, 1.0);
+    assert_eq!(models.identify("codex", "GPT-6.2-Astra", Some("priority")), (model, 2.0));
+    assert_eq!(models.identify("codex", "gpt-6.2-astra", Some("ultrafast")), (model, 6.0));
+    assert_eq!(models.identify("codex", "gpt-6.1-sol", Some("fast")).1, 2.5);
+    assert_eq!(models.identify("codex", "gpt-6.1-sol", Some("ultrafast")).1, 8.0);
+    let unspecified = models.identify("codex", "gpt-6.2-astra", None);
+    assert_ne!(unspecified.0, model);
+    assert_ne!(models.identify("codex", "gpt-6.2-astra", Some("flex")).0, unspecified.0);
+    assert_eq!(models.identify("antigravity", "gpt-6.2-astra", Some("fast")).1, 1.0);
+    assert_eq!(models.identify("codex", "codex-auto-review", None), (None, 0.0));
+    assert_eq!(models.identify("codex", "code-review", None).1, 1.0);
+    let end = T + 5 * HOUR;
+    let rows = [reading(T, 90.0, end), reading(T + 2, 80.0, end), reading(T + 3, 75.0, end)];
+    let mut data = ledger(vec![Request { speed_factor: 0.0, ..unpriced(T + 1, 10_000) },
+        request(T + 2, 1000, 1.0), Request { speed_factor: 0.0, ..unpriced(T + 3, 20_000) }], T + 3);
+    let f = estimate(&window(300, end), data.through, &rows, &data, data.through).unwrap();
+    assert_eq!((f.total_tokens, f.total_usd, f.used_tokens, f.missing_price), (Some(10_000), Some(10.0), Some(31_000), true));
+    data.groups.get_mut("").unwrap().retain(|r| !r.billable());
+    assert!(estimate(&window(300, end), data.through, &rows, &data, data.through).unwrap().total_tokens.is_none());
+}
+
+#[test]
+fn speed_scales_once_and_validation_rejects_noisy_model_rates()
+{
+    let history = Calibration::default();
+    let work = |model, tokens, speed_factor| Workload::from_requests([Request {
+        model: Some(model), speed_factor, ..request(T, tokens, 0.1)
+    }].iter());
+    let mut current = Calibration::default();
+    for _ in 0..2
+    {
+        current.observe(&work(0, 100, 1.0), 5.0);
+        current.observe(&work(1, 1000, 1.0), 5.0);
+    }
+    assert_eq!(current.predict_points(&history, &work(0, 100, 2.0)), Some(10.0));
+    let mut validation = Validation::default();
+    for _ in 0..3
+    {
+        let later = work(0, 100, 1.0);
+        validation.compare(&later, 1.0, &current, &history);
+        current.observe(&later, 1.0);
+    }
+    assert!(!validation.accepted());
 }

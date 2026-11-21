@@ -24,6 +24,10 @@ pub(super) const SCHEMA: &str = "
         PRIMARY KEY(tool,path,event)
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS forecast_requests_time ON forecast_requests(tool,at);
+    CREATE TABLE IF NOT EXISTS forecast_request_tiers (
+        tool TEXT NOT NULL, path TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL, tier TEXT NOT NULL,
+        PRIMARY KEY(tool,path,event)
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS forecast_scans (tool TEXT PRIMARY KEY, at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS forecast_resets (series TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
 ";
@@ -79,7 +83,9 @@ fn files(root: &Path, tool: &str, cutoff: i64, depth: usize, output: &mut Vec<So
         let modified = (time.max(wal_time) / 1_000_000) as i64;
         if modified >= cutoff
         {
-            output.push(SourceFile { path, stamp: format!("{time}/{size}/{wal_time}/{wal_size}"), modified });
+            // Re-read available Codex rollouts once to pick up explicitly recorded service tiers.
+            let version = if tool == "codex" { "tier1/" } else { "" };
+            output.push(SourceFile { path, stamp: format!("{version}{time}/{size}/{wal_time}/{wal_size}"), modified });
         }
     }
     Ok(())
@@ -98,7 +104,9 @@ fn store_requests(db: &Connection, tool: &str, path: &Path, file: MeteredFile, p
 {
     let source = path.to_string_lossy();
     db.execute("DELETE FROM forecast_requests WHERE tool=?1 AND path=?2", params![tool, source])?;
+    db.execute("DELETE FROM forecast_request_tiers WHERE tool=?1 AND path=?2", params![tool, source])?;
     let mut insert = db.prepare_cached("INSERT OR IGNORE INTO forecast_requests VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
+    let mut tiers = db.prepare_cached("INSERT OR IGNORE INTO forecast_request_tiers VALUES (?1,?2,?3,?4,?5)")?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let session = name.split(".jsonl").next().unwrap_or(&name);
     let mut occurrences = HashMap::<i64, usize>::new();
@@ -118,6 +126,10 @@ fn store_requests(db: &Connection, tool: &str, path: &Path, file: MeteredFile, p
         let model = request.model.unwrap_or_default();
         let (usd, missing) = prices.request_cost(price_provider(tool, &model), &model, request.counts);
         insert.execute(params![tool, source, event, request.at, model, request.counts.total(), usd, missing])?;
+        if let Some(tier) = request.service_tier
+        {
+            tiers.execute(params![tool, source, event, request.at, tier])?;
+        }
     }
     Ok(())
 }
@@ -204,6 +216,7 @@ pub(super) fn sync(
         if let Some(account) = current_codex_account(sources) { store_profile(&tx, tool, now, None, Some(&account))?; }
     }
     tx.execute("DELETE FROM forecast_requests WHERE tool=?1 AND at<?2", params![tool, cutoff])?;
+    tx.execute("DELETE FROM forecast_request_tiers WHERE tool=?1 AND at<?2", params![tool, cutoff])?;
     tx.execute("DELETE FROM forecast_files WHERE tool=?1 AND modified<?2", params![tool, cutoff])?;
     tx.execute("INSERT OR REPLACE INTO forecast_scans VALUES (?1,?2)", params![tool, now])?;
     tx.commit()?;

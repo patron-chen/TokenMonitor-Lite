@@ -92,6 +92,7 @@ export interface QuotaWindow
 export interface QuotaForecast
 {
   basis: 'current' | 'history' | 'insufficient';
+  modelMixRequests?: number | null;
   observedAt: number;
   usedTokens: number | null;
   usedUsd: number | null;
