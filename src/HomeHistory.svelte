@@ -14,11 +14,10 @@
   const dateKey = (at: number) => new Date(at).toISOString().slice(0, 10);
   let history = $derived.by(() => {
     if (!data) return null;
-    const finish = toDay(data.today);
+    const finish = toDay(data.today) - oneDay;
     const sunday = finish + (6 - (new Date(finish).getUTCDay() + 6) % 7) * oneDay;
     const first = sunday - (weeks * 7 - 1) * oneDay;
-    const values = new Map(data.days.map(row => [row.date, row.tokens]));
-    values.set(data.today, data.todayTokens);
+    const values = new Map(data.days.filter(row => row.date < data.today).map(row => [row.date, row.tokens]));
     const cells = Array.from({ length: weeks * 7 }, (_, index) => {
       const at = first + index * oneDay;
       const date = dateKey(at);

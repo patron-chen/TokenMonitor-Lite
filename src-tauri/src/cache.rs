@@ -170,17 +170,19 @@ impl Cache
         summary(&transaction, period, range_key)
     }
 
-    pub fn activity(&self, range_key: &str) -> rusqlite::Result<Option<Vec<DailyUsage>>>
+    pub fn activity(&self, range_key: &str, today: &str) -> rusqlite::Result<Option<Vec<DailyUsage>>>
     {
         let mut connection = self.connect(true)?;
+        // The opening window uses this cache directly. A busy database can be retried by the worker.
+        connection.busy_timeout(Duration::ZERO)?;
         let tx = connection.transaction()?;
         if tx.query_row("SELECT 1 FROM snapshots WHERE period = 'activity' AND range_key = ?1",
             [range_key], |row| row.get::<_, i32>(0)).optional()?.is_none()
         {
             return Ok(None);
         }
-        let mut stmt = tx.prepare("SELECT date, tokens FROM activity_days ORDER BY date")?;
-        let rows = stmt.query_map([], |row| Ok(DailyUsage { date: row.get(0)?, tokens: row.get(1)? }))?;
+        let mut stmt = tx.prepare("SELECT date, tokens FROM activity_days WHERE date < ?1 ORDER BY date")?;
+        let rows = stmt.query_map([today], |row| Ok(DailyUsage { date: row.get(0)?, tokens: row.get(1)? }))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map(Some)
     }
 

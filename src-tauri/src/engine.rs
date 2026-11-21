@@ -194,8 +194,22 @@ impl Engine
         })
     }
 
+    pub fn cached_activity(&self) -> rusqlite::Result<Option<Activity>>
+    {
+        let span = current_span(Period::Today);
+        let tools = self.tracked_tools();
+        let today = span.start.expect("today").to_string();
+        let days = if tools.any() { self.cache.activity(&tools.scope(span.key()), &today)? }
+            else { Some(vec![]) };
+        Ok(days.map(|days| Activity { today, days }))
+    }
+
     pub fn activity(&self, force: bool) -> Result<Activity, String>
     {
+        if !force
+        {
+            if let Ok(Some(activity)) = self.cached_activity() { return Ok(activity); }
+        }
         let (reply, result) = mpsc::channel();
         self.signals.send(Signal::Activity(force, reply)).map_err(|_| "Usage worker is unavailable.".to_string())?;
         result.recv().map_err(|_| "Usage worker is unavailable.".to_string())?
@@ -465,7 +479,8 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
         let span = current_span(Period::Today);
         let key = tools.scope(span.key());
         let today = span.start.expect("today");
-        let mut cached = self.cache.activity(&key).ok().flatten();
+        let date = today.to_string();
+        let mut cached = self.cache.activity(&key, &date).ok().flatten();
         let days = if !tools.any()
         {
             vec![]
@@ -497,8 +512,7 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
                 Err(error) => cached.ok_or(error)?,
             }
         };
-        let today_tokens = self.cache.summary(Period::Today, &key).map_or(0, |summary| summary.usage.tokens);
-        Ok(Activity { today: today.to_string(), today_tokens, days })
+        Ok(Activity { today: date, days })
     }
 }
 
@@ -822,6 +836,47 @@ mod resume
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn cached_activity_reads_past_days_without_the_usage_worker()
+    {
+        let root = std::env::temp_dir().join(format!("lite-activity-cache-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("usage-v1.sqlite");
+        let (signals, receiver) = mpsc::channel();
+        // An activity lookup that queues a scan will fail immediately in this fixture.
+        drop(receiver);
+        let engine = Engine {
+            sources: Sources::from_home(Some(root.clone())),
+            cache: Cache::new(file.clone()).unwrap(),
+            preferences: Arc::new(PreferencesStore::load(&root)),
+            signals,
+            tray: Arc::default(), progress: Arc::default(), watching: Arc::default(), stopped: Arc::default(),
+            worker: Mutex::new(None),
+        };
+        let span = current_span(Period::Today);
+        let today = span.start.unwrap();
+        let yesterday = today.pred_opt().unwrap().to_string();
+        assert!(engine.cached_activity().unwrap().is_none());
+        engine.cache.replace_activity(&engine.scope_key(&span), Utc::now().timestamp_millis(), &[
+            DailyUsage { date: yesterday.clone(), tokens: 42 },
+            DailyUsage { date: today.to_string(), tokens: 999 },
+        ]).unwrap();
+
+        let activity = engine.activity(false).unwrap();
+        assert_eq!(activity.today, today.to_string());
+        assert_eq!(activity.days.len(), 1);
+        assert_eq!((activity.days[0].date.as_str(), activity.days[0].tokens), (yesterday.as_str(), 42));
+        assert!(engine.activity(true).is_err());
+        drop(engine);
+        for name in ["usage-v1.sqlite-wal", "usage-v1.sqlite-shm"]
+        {
+            let sidecar = root.join(name);
+            if sidecar.exists() { fs::remove_file(sidecar).unwrap(); }
+        }
+        fs::remove_file(file).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn continuous_log_notifications_do_not_activate_the_tray_or_restart_backoff()

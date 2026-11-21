@@ -142,7 +142,7 @@
     backend.updated(period => {
       if (ready && period === 'today' && settingsOpen && settingsSection === 'collection') void loadCollection();
       if (ready && period === route.period) void refreshScreen(true);
-      else if (ready && period === 'today' && route.view === 'home') void refreshActivityToday();
+      if (ready && period === 'today' && route.view === 'home' && activity && activity.today !== localDay()) void loadActivity();
     }).then(unlisten => {
       if (disposed) unlisten();
       else unsubscribe = unlisten;
@@ -175,6 +175,7 @@
       }
       backdrop = previous.backdrop;
       appearance = previous.appearance;
+      activity = previous.cachedActivity ?? null;
       quotas = previous.cachedQuotas ?? null;
       lastQuotaCheck = quotas?.checkedAt ?? 0;
       ready = true;
@@ -217,20 +218,6 @@
     }
     catch { if (request === activityRequest) activityError = true; }
     finally { if (request === activityRequest) activityLoading = false; }
-  }
-
-  function updateActivityToday(data: Summary)
-  {
-    if (!activity) return;
-    if (activity.today !== localDay()) void loadActivity();
-    else if (data.updatedAt) activity.todayTokens = data.usage.tokens;
-  }
-
-  async function refreshActivityToday()
-  {
-    if (!activity) return;
-    try { updateActivityToday(await backend.summary('today')); }
-    catch { /* Keep the last completed activity view. */ }
   }
 
   async function recordBankedResetPanel(request: number, readFailed: boolean)
@@ -432,7 +419,6 @@
       if (request !== summaryRequest || period !== route.period) return;
       const changed = summary?.updatedAt !== data.updatedAt;
       summary = data;
-      if (period === 'today') updateActivityToday(data);
       error = null;
       if (fromUpdate && !changed) return;
       if (route.selection && hasSessions) await loadDetail(fromUpdate);
@@ -1023,8 +1009,10 @@
           </div>
         </section>
       {/if}
+    {/if}
+    {#if !route.selection && route.view === 'home' && (activity || summary?.updatedAt)}
       <HomeHistory data={activity} failed={activityError} />
-      {#if hasSessions && sessions.rows.length}
+      {#if summary?.updatedAt && hasSessions && sessions.rows.length}
         <section class="home-section">
           <button class="section-link" onclick={() => chooseView('sessions', true)}>{viewLabel('sessions')}
             <span class="icon" style:--icon={'url(' + icons.sessions + ')'} aria-hidden="true"></span>

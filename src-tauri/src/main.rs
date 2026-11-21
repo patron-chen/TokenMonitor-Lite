@@ -49,6 +49,7 @@ const DEFAULT_SIZE: LogicalSize<f64> = LogicalSize::new(432.0, 880.0);
 struct WindowMemory
 {
     view: Mutex<Value>,
+    cached_activity: Mutex<Option<Activity>>,
     size: Mutex<Option<LogicalSize<f64>>>,
     backdrop: Mutex<Option<backdrop::Backdrop>>,
     appearance: Mutex<Appearance>,
@@ -96,6 +97,14 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
     let preferred = memory.size.lock().expect("window size").unwrap_or(DEFAULT_SIZE);
     let placement = placement::for_tray(app, icon, preferred);
     let size = placement.as_ref().map_or(preferred, |target| target.logical_size);
+    let engine = app.state::<Arc<Engine>>();
+    let home = {
+        let view = memory.view.lock().expect("view state");
+        view["view"].as_str().is_none_or(|name| name == "home") && view["selection"].is_null()
+    };
+    // Give the new WebView the cached graph before the usage worker starts its opening scan.
+    *memory.cached_activity.lock().expect("cached activity") =
+        if home { engine.cached_activity().ok().flatten() } else { None };
     let window = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("index.html".into()))
         // DWM can paint the native title behind the transparent WebView2 header.
         .title("")
@@ -115,7 +124,7 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
                 (cfg!(debug_assertions) && url.host_str() == Some("127.0.0.1"))
         })
         .build()?;
-    app.state::<Arc<Engine>>().interact(Interaction::Window(true));
+    engine.interact(Interaction::Window(true));
     if let Some(target) = placement
     {
         // Move to the tray's monitor before applying the size in that monitor's DPI.
@@ -199,6 +208,7 @@ fn get_view_state(
         "appearance": *memory.appearance.lock().expect("appearance"),
         "preferences": preferences,
         "systemLanguage": Language::System.resolve(),
+        "cachedActivity": *memory.cached_activity.lock().expect("cached activity"),
         "cachedQuotas": quotas.cached(preferences.quotas.tools),
     })
 }

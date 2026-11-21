@@ -77,7 +77,7 @@ export interface Summary
 }
 
 export interface DailyUsage { date: string; tokens: number }
-export interface Activity { today: string; todayTokens: number; days: DailyUsage[] }
+export interface Activity { today: string; days: DailyUsage[] }
 
 export interface QuotaWindow
 {
@@ -238,7 +238,7 @@ export const backend = {
   detailsReady: () => invoke<void>('details_ready'),
   view: () => invoke<{
     view: ViewState | null; backdrop: Backdrop; appearance: Appearance; preferences: Preferences; cachedQuotas: Quotas | null;
-    systemLanguage: UiLanguage;
+    cachedActivity: Activity | null; systemLanguage: UiLanguage;
   }>('get_view_state'),
   remember: (view: ViewState) => invoke<void>('remember_view', { view }),
   appearance: (appearance: Appearance) => invoke<void>('set_appearance', { appearance }),

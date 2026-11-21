@@ -227,7 +227,6 @@ pub struct DailyUsage
 pub struct Activity
 {
     pub today: String,
-    pub today_tokens: u64,
     pub days: Vec<DailyUsage>,
 }
 
