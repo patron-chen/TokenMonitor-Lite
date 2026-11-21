@@ -1,4 +1,6 @@
-use tauri::{AppHandle, LogicalSize, PhysicalPosition, PhysicalSize, Rect};
+use tauri::{AppHandle, LogicalSize, PhysicalPosition, PhysicalSize, Rect, WebviewWindow};
+
+pub const QUOTA_POPUP_WIDTH: f64 = 312.0;
 
 #[derive(Clone, Copy)]
 struct Area
@@ -89,6 +91,35 @@ pub fn for_tray(app: &AppHandle, rect: Option<Rect>, preferred: LogicalSize<f64>
     Some(Placement { position: place(screen, work, icon, size, gap), size, logical_size: size.to_logical(scale) })
 }
 
+fn place_quota_popup(work: Area, owner: Area, client_y: i32, row_top: f64, height: f64, scale: f64) -> Placement
+{
+    let gap = (8.0 * scale).round() as i32;
+    let wanted: PhysicalSize<u32> = LogicalSize::new(QUOTA_POPUP_WIDTH, height).to_physical(scale);
+    let size = PhysicalSize::new(
+        wanted.width.min((work.right - work.x - 2 * gap).max(1) as u32),
+        wanted.height.min((work.bottom - work.y - 2 * gap).max(1) as u32),
+    );
+    let min_x = work.x + gap;
+    let max_x = (work.right - gap - size.width as i32).max(min_x);
+    let left = owner.x - gap - size.width as i32;
+    let right = owner.right + gap;
+    let sides = if owner.x - work.x >= work.right - owner.right { [left, right] } else { [right, left] };
+    let x = sides.into_iter().find(|x| (min_x..=max_x).contains(x)).unwrap_or(sides[0].clamp(min_x, max_x));
+    let min_y = work.y + gap;
+    let max_y = (work.bottom - gap - size.height as i32).max(min_y);
+    // The renderer supplies CSS pixels relative to the client area, which excludes the native frame.
+    let y = (client_y + (row_top * scale).round() as i32).clamp(min_y, max_y);
+    Placement { position: PhysicalPosition::new(x, y), size, logical_size: size.to_logical(scale) }
+}
+
+pub fn for_quota_popup(owner: &WebviewWindow, row_top: f64, height: f64) -> tauri::Result<Option<Placement>>
+{
+    let Some(monitor) = owner.current_monitor()? else { return Ok(None) };
+    let work = Area::from_parts(monitor.work_area().position, monitor.work_area().size);
+    let bounds = Area::from_parts(owner.outer_position()?, owner.outer_size()?);
+    Ok(Some(place_quota_popup(work, bounds, owner.inner_position()?.y, row_top, height, monitor.scale_factor())))
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -112,5 +143,39 @@ mod tests
         let right = Area { right: -60, ..screen };
         let right_icon = Area { x: -42, right: -18, y: 990, bottom: 1014 };
         assert_eq!(place(screen, right, Some(right_icon), size, 12).x, -669);
+    }
+
+    #[test]
+    fn quota_popup_uses_the_roomier_side_and_aligns_to_the_row()
+    {
+        let work = Area { x: 0, y: 24, right: 1600, bottom: 900 };
+        let owner = Area { x: 100, y: 70, right: 532, bottom: 750 };
+        let right = place_quota_popup(work, owner, 72, 180.0, 250.0, 1.0);
+        assert_eq!(right.position, PhysicalPosition::new(540, 252));
+        let owner = Area { x: 1068, right: 1500, ..owner };
+        let left = place_quota_popup(work, owner, 72, 180.0, 250.0, 1.0);
+        assert_eq!(left.position, PhysicalPosition::new(748, 252));
+    }
+
+    #[test]
+    fn quota_popup_clamps_in_a_narrow_workspace()
+    {
+        let work = Area { x: -580, y: -200, right: 0, bottom: 440 };
+        let owner = Area { x: -510, y: -170, right: -78, bottom: 390 };
+        let popup = place_quota_popup(work, owner, -169, 550.0, 900.0, 1.0);
+        assert_eq!(popup.position, PhysicalPosition::new(-320, -192));
+        assert_eq!(popup.size, PhysicalSize::new(312, 624));
+    }
+
+    #[test]
+    fn quota_popup_scales_bounds_and_row_offset_on_a_secondary_monitor()
+    {
+        let work = Area { x: -1920, y: -60, right: 0, bottom: 1020 };
+        let owner = Area { x: -670, y: 110, right: -22, bottom: 950 };
+        let popup = place_quota_popup(work, owner, 112, 100.0, 250.0, 1.5);
+        assert_eq!(popup.position, PhysicalPosition::new(-1150, 262));
+        assert_eq!(popup.size, PhysicalSize::new(468, 375));
+        let near_bottom = place_quota_popup(work, owner, 112, 490.0, 250.0, 1.5);
+        assert_eq!(near_bottom.position.y, 633);
     }
 }

@@ -16,7 +16,6 @@
   import SessionModel from './SessionModel.svelte';
   import Pager from './Pager.svelte';
   import SettingsPanel from './SettingsPanel.svelte';
-  import './styles.css';
 
   const initial: ViewState = {
     period: 'today', view: 'home', fromHome: false, tool: null, query: '',
@@ -966,7 +965,7 @@
       {#if !error && !summary?.failure}<p class="notice" role="status">{local('Reading local usage…', '正在读取本地用量…')}</p>{/if}
     {:else if route.view === 'limits'}
       <QuotaView data={shownQuotas} loading={quotaLoading} {now} focusTool={route.expanded}
-        tracked={preferences.collection.tools} onUpdate={applyQuotas} />
+        tracked={preferences.collection.tools} fontScale={appearance.fontScale} onUpdate={applyQuotas} />
     {:else if route.view === 'tools'}
       <BreakdownRows rows={summary.tools} kind="tool" mode={route.toolMode} expanded={route.expanded} activate={expand} />
       {#if antigravityWithoutUsage}

@@ -13,6 +13,7 @@ mod popover;
 mod pricing;
 mod quota;
 mod quota_history;
+mod quota_popup;
 mod session_metadata;
 mod settings;
 mod sources;
@@ -22,8 +23,8 @@ use std::{fs, path::PathBuf, sync::{Arc, Mutex}, time::Instant};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, Rect, RunEvent, State,
-    WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, Rect, RunEvent, State, Url,
+    WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
 };
 
 use app_log::AppLog;
@@ -54,6 +55,7 @@ struct WindowMemory
     backdrop: Mutex<Option<backdrop::Backdrop>>,
     appearance: Mutex<Appearance>,
     popover: Mutex<Popover>,
+    quota_popup: Mutex<quota_popup::Popup>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -82,6 +84,12 @@ fn app_data_root() -> PathBuf
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("TokenMonitorLite")
+}
+
+fn app_navigation(url: &Url) -> bool
+{
+    url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost") ||
+        (cfg!(debug_assertions) && url.host_str() == Some("127.0.0.1"))
 }
 
 fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
@@ -119,10 +127,7 @@ fn show_details(app: &AppHandle, anchor: Option<Rect>) -> tauri::Result<()>
         .visible(false)
         .focused(false)
         .data_directory(app_data_root().join("WebView2"))
-        .on_navigation(|url| {
-            url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost") ||
-                (cfg!(debug_assertions) && url.host_str() == Some("127.0.0.1"))
-        })
+        .on_navigation(app_navigation)
         .build()?;
     engine.interact(Interaction::Window(true));
     if let Some(target) = placement
@@ -193,7 +198,33 @@ fn close_details(app: &AppHandle) -> tauri::Result<()>
     let Some(window) = app.get_webview_window(WINDOW) else { return Ok(()) };
     app.state::<WindowMemory>().popover.lock().expect("popover").closing();
     remember_size(app);
+    quota_popup::destroy(app);
     window.destroy()
+}
+
+fn panel_blur(owner: &Window)
+{
+    if quota_popup::is_visible(owner.app_handle())
+    {
+        // A focus transfer between the two WebViews can notify the old window first.
+        let owner = owner.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = owner.app_handle().clone().run_on_main_thread(move || close_if_blurred(&owner));
+        });
+    }
+    else { close_if_blurred(owner); }
+}
+
+fn close_if_blurred(owner: &Window)
+{
+    let app = owner.app_handle();
+    if !owner.is_visible().unwrap_or(false) || owner.is_focused().unwrap_or(false) || quota_popup::is_focused(app)
+    {
+        return;
+    }
+    let point = app.cursor_position().ok();
+    let should_close = app.state::<WindowMemory>().popover.lock().expect("popover").blur(point, Instant::now());
+    if should_close { let _ = close_details(app); }
 }
 
 #[tauri::command]
@@ -450,9 +481,14 @@ fn main()
         .invoke_handler(tauri::generate_handler![
             details_ready, dismiss_window, get_view_state, remember_view, set_appearance, set_preferences, get_collection_status,
             get_summary, get_activity, get_quotas, record_banked_reset_panel, get_quota_history, reset_quota_forecast,
-            list_sessions, get_session_detail, refresh
+            quota_popup::set_quota_popup, quota_popup::report_quota_popup, list_sessions, get_session_detail, refresh
         ])
         .on_window_event(|window, event| {
+            if window.label() == quota_popup::WINDOW
+            {
+                quota_popup::on_event(window.app_handle(), event);
+                return;
+            }
             if window.label() != WINDOW
             {
                 return;
@@ -472,11 +508,13 @@ fn main()
                 }
                 WindowEvent::Destroyed =>
                 {
+                    quota_popup::destroy(app);
                     app.state::<Arc<Engine>>().interact(Interaction::Window(false));
                     *memory.backdrop.lock().expect("window material") = None;
                     #[cfg(windows)]
                     backdrop::release();
                 }
+                WindowEvent::Moved(_) => quota_popup::reposition(app),
                 #[cfg(windows)]
                 WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } =>
                 {
@@ -486,6 +524,7 @@ fn main()
                     {
                         backdrop::resize(window);
                     }
+                    quota_popup::reposition(app);
                 }
                 WindowEvent::Focused(true) =>
                 {
@@ -493,9 +532,7 @@ fn main()
                 }
                 WindowEvent::Focused(false) if !window.is_focused().unwrap_or(false) =>
                 {
-                    let point = app.cursor_position().ok();
-                    let should_close = memory.popover.lock().expect("popover").blur(point, Instant::now());
-                    if should_close { let _ = close_details(app); }
+                    panel_blur(window);
                 }
                 _ => {}
             }

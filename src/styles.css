@@ -145,7 +145,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .hero-cost { color: var(--muted); font: 500 0.75rem/1.35 var(--mono); font-variant-numeric: tabular-nums; }
 .updated { font: 0.625rem/1.25 var(--font); color: var(--low); white-space: nowrap; }
 .viewport { flex: 1 1 0; min-height: 0; padding-inline: var(--inset); overflow: auto; overscroll-behavior: contain; }
-.viewport, .quota-history-card { scrollbar-width: none; }
+.viewport, .quota-history-popup, .forecast-tip { scrollbar-width: none; }
 .notice { margin: 7px var(--inset) 9px; color: var(--muted); font-size: 0.6875rem; line-height: 1.45; }
 .viewport .notice { margin-inline: 0; }
 .notice.error { color: #f5abb4; }
@@ -314,24 +314,35 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .limits-meter > span { display: block; width: var(--remaining); height: 100%; border-radius: inherit; background: var(--row-ink); }
 .limits-balance { width: 100%; margin-top: 8px; }
 .limits-provider .quota-banked { margin: 8px 0 0; }
-.quota-history-card
+.quota-history-popup, .forecast-tip
 {
-  position: fixed;
-  inset: auto;
-  width: min(312px, calc(100vw - 16px));
-  max-height: calc(100vh - 16px);
-  margin: 0;
-  padding: 12px;
   overflow: auto;
-  border: 1px solid #c8daea45;
   border-radius: 9px;
   background: linear-gradient(135deg, #394148, #242b30);
   color: var(--text);
-  box-shadow: 0 8px 28px #0005;
   font-size: 0.625rem;
 }
+.quota-history-popup
+{
+  height: 100%;
+  overscroll-behavior: contain;
+  box-shadow: inset 0 0 0 1px #c8daea45;
+}
+.quota-history-popup:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+.quota-history-content { padding: 12px; }
+.forecast-tip
+{
+  position: fixed;
+  inset: auto;
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid #c8daea45;
+  box-shadow: 0 8px 28px #0005;
+}
 .quota-history-title, .quota-history-current, .quota-history-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
-.quota-history-card.forecast-tip { width: max-content; max-width: calc(100vw - 16px); padding: 7px 9px; }
 .forecast-tip strong, .forecast-tip small { display: block; }
 .forecast-tip small { margin-top: 2px; color: var(--muted); font-size: 0.5625rem; }
 .quota-history-title strong { font-size: 0.75rem; }

@@ -1,34 +1,33 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { backend, toolIds } from './api';
-  import type { QuotaBalance, QuotaHistory, QuotaKey, Quotas, QuotaWindow, ToolQuota, ToolSelection } from './api';
+  import type { QuotaBalance, QuotaKey, Quotas, QuotaWindow, ToolQuota, ToolSelection } from './api';
   import { apiDollars, compact, local, relativeTime, time, toolInfo } from './display';
+  import { isChinese } from './language.svelte';
   import { duration, forecastLabel, quotaGroups, quotaMoney, remainingPercent, reset } from './quota-display';
+  import { quotaPopup } from './quota-popup';
+  import type { QuotaMetric } from './quota-popup';
   import QuotaBanked from './QuotaBanked.svelte';
-  import QuotaHistoryCard from './QuotaHistoryCard.svelte';
 
   interface Props
   {
-    data: Quotas | null; loading: boolean; now: number; focusTool: string | null; tracked: ToolSelection;
+    data: Quotas | null; loading: boolean; now: number; focusTool: string | null; tracked: ToolSelection; fontScale: number;
     onUpdate: (snapshot: Quotas) => void;
   }
-  interface Metric { key: QuotaKey; label: string; current: string; resetAt: number | null }
 
-  let { data, loading, now, focusTool, tracked, onUpdate }: Props = $props();
+  let { data, loading, now, focusTool, tracked, fontScale, onUpdate }: Props = $props();
   let providers = $derived(toolIds.flatMap(tool => data?.tools.find(row => row.tool === tool) ?? []));
   let element: HTMLElement | undefined = $state();
-  let card: HTMLDivElement | undefined = $state();
-  let active = $state<{ metric: Metric; anchor: HTMLButtonElement; forecast: boolean } | null>(null);
-  let history = $state<QuotaHistory | null>(null);
-  let failed = $state(false);
+  let forecastTip: HTMLDivElement | undefined = $state();
+  let active = $state<{ metric: QuotaMetric; anchor: HTMLButtonElement; forecast: boolean; id: number; focusPopup: boolean } | null>(null);
+  let historyTop = $state<number | null>(null);
   let resetState = $state<Record<string, 'pending' | 'failed'>>({});
+  let popupRequested = false;
   let pinned = false;
   let hoverBlocked = false;
   let opening: ReturnType<typeof setTimeout> | undefined;
   let closing: ReturnType<typeof setTimeout> | undefined;
   let alignedTool: string | null = null;
-  const remembered = new Map<string, { revision: number | null; history: QuotaHistory }>();
-  let visibleMetric = $derived(active && currentMetric(active.metric));
   let activeKey = $derived(active && !active.forecast ? JSON.stringify(active.metric.key) : '');
   let activeWindow = $derived.by(() => {
     const key = active?.metric.key;
@@ -40,21 +39,28 @@
 
   onMount(() => {
     const viewport = element?.closest('.viewport');
-    const updatePosition = () => {
-      if (!active || !viewport) return;
-      const row = active.anchor.getBoundingClientRect();
-      const clip = viewport.getBoundingClientRect();
-      if (row.bottom <= clip.top || row.top >= clip.bottom) dismiss();
-      else position();
-    };
-    viewport?.addEventListener('scroll', updatePosition, { passive: true });
+    viewport?.addEventListener('scroll', position, { passive: true });
     const size = new ResizeObserver(position);
-    if (card) size.observe(card);
+    if (forecastTip) size.observe(forecastTip);
+    if (element) size.observe(element);
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    quotaPopup.onInteraction(({ id, kind }) => {
+      if (!active || active.forecast || active.id !== id) return;
+      if (kind === 'enter') cancelTimers();
+      else if (kind === 'leave') leave();
+      else closeAndRestoreFocus();
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else unsubscribe = unlisten;
+    }).catch(() => {});
     return () => {
-      viewport?.removeEventListener('scroll', updatePosition);
+      disposed = true;
+      unsubscribe?.();
+      viewport?.removeEventListener('scroll', position);
       size.disconnect();
-      clearTimeout(opening);
-      clearTimeout(closing);
+      cancelTimers();
+      clearPopup();
     };
   });
 
@@ -70,24 +76,27 @@
   });
 
   $effect(() => {
-    const key = active?.forecast ? null : active?.metric.key;
+    if (!active || active.forecast || historyTop === null)
+    {
+      clearPopup();
+      return;
+    }
+    const metric = currentMetric(active.metric);
     const revision = data ? Math.max(data.checkedAt ?? 0, data.observedAt) : null;
-    if (!key) return;
-    const id = JSON.stringify(key);
-    const previous = remembered.get(id);
-    history = previous?.history ?? null;
-    failed = false;
-    if (previous?.revision === revision) return;
-    let cancelled = false;
-    backend.quotaHistory(key).then(result => {
-      if (cancelled) return;
-      remembered.set(id, { revision, history: result });
-      history = result;
-    }).catch(() => {
-      if (!cancelled && !previous) failed = true;
-    });
-    return () => { cancelled = true; };
+    const id = active.id;
+    popupRequested = true;
+    void quotaPopup.set({
+      selection: { ...metric, id, revision, language: isChinese() ? 'zh-CN' : 'en', fontScale },
+      top: historyTop, focus: active.focusPopup
+    }).catch(() => { if (active?.id === id) dismiss(); });
   });
+
+  function clearPopup()
+  {
+    if (!popupRequested) return;
+    popupRequested = false;
+    void quotaPopup.set(null).catch(() => {});
+  }
 
   function source(provider: ToolQuota)
   {
@@ -97,7 +106,7 @@
     return label + (provider.bankedReset ? ' · OAuth' : '');
   }
 
-  function windowMetric(provider: ToolQuota, window: QuotaWindow): Metric
+  function windowMetric(provider: ToolQuota, window: QuotaWindow): QuotaMetric
   {
     const remaining = remainingPercent(window.remaining);
     return {
@@ -108,7 +117,7 @@
     };
   }
 
-  function balanceMetric(provider: ToolQuota, balance: QuotaBalance): Metric
+  function balanceMetric(provider: ToolQuota, balance: QuotaBalance): QuotaMetric
   {
     return {
       key: { kind: 'balance', tool: provider.tool, currency: balance.currency },
@@ -118,7 +127,7 @@
     };
   }
 
-  function currentMetric(metric: Metric)
+  function currentMetric(metric: QuotaMetric)
   {
     const { key } = metric;
     const provider = providers.find(row => row.tool === key.tool);
@@ -132,41 +141,43 @@
     return window ? windowMetric(provider, window) : metric;
   }
 
-  async function open(metric: Metric, anchor: HTMLButtonElement, forecast = false)
+  async function open(metric: QuotaMetric, anchor: HTMLButtonElement, forecast = false, focusPopup = false)
   {
-    active = { metric, anchor, forecast };
-    await tick();
-    if (!card || active?.anchor !== anchor) return;
-    if (!card.matches(':popover-open')) card.showPopover();
+    const id = quotaPopup.nextId();
+    active = { metric, anchor, forecast, id, focusPopup };
+    if (forecast)
+    {
+      await tick();
+      if (!forecastTip || active?.id !== id) return;
+      if (!forecastTip.matches(':popover-open')) forecastTip.showPopover();
+    }
+    else if (forecastTip?.matches(':popover-open')) forecastTip.hidePopover();
     position();
   }
 
   function position()
   {
-    if (!active || !card?.matches(':popover-open')) return;
-    // Leave the forecast button reachable when the history card opens below its reading.
-    const anchor = active.forecast ? active.anchor : active.anchor.closest('.limits-window') ?? active.anchor;
-    const row = anchor.getBoundingClientRect();
-    const panel = card.getBoundingClientRect();
+    if (!active) return;
+    const clip = element?.closest('.viewport')?.getBoundingClientRect();
+    const row = active.anchor.getBoundingClientRect();
+    if (!active.anchor.isConnected || (clip && (row.bottom <= clip.top || row.top >= clip.bottom)))
+    {
+      dismiss();
+      return;
+    }
+    if (!active.forecast)
+    {
+      historyTop = row.top;
+      return;
+    }
+    if (!forecastTip?.matches(':popover-open')) return;
+    const panel = forecastTip.getBoundingClientRect();
     const space = 8;
     const right = window.innerWidth - panel.width - space;
     const bottom = window.innerHeight - panel.height - space;
-    if (active.forecast)
-    {
-      const above = row.top - panel.height - space;
-      card.style.left = Math.max(space, Math.min(right, row.right - panel.width)) + 'px';
-      card.style.top = Math.max(space, Math.min(bottom, above >= space ? above : row.bottom + space)) + 'px';
-      return;
-    }
-    const besideRight = row.right + space <= right;
-    const besideLeft = row.left - panel.width - space >= space;
-    const left = besideRight ? row.right + space : besideLeft ? row.left - panel.width - space : row.left;
     const above = row.top - panel.height - space;
-    const below = row.bottom + space;
-    const vertical = below <= bottom || above < space ? below : above;
-    const top = besideRight || besideLeft ? row.top : vertical;
-    card.style.left = Math.max(space, Math.min(right, left)) + 'px';
-    card.style.top = Math.max(space, Math.min(bottom, top)) + 'px';
+    forecastTip.style.left = Math.max(space, Math.min(right, row.right - panel.width)) + 'px';
+    forecastTip.style.top = Math.max(space, Math.min(bottom, above >= space ? above : row.bottom + space)) + 'px';
   }
 
   function cancelTimers()
@@ -175,14 +186,14 @@
     clearTimeout(closing);
   }
 
-  function hover(metric: Metric, anchor: HTMLButtonElement, delay = 180)
+  function hover(metric: QuotaMetric, anchor: HTMLButtonElement, delay = 180)
   {
     cancelTimers();
     if (pinned || active?.anchor === anchor) return;
     opening = setTimeout(() => void open(metric, anchor), delay);
   }
 
-  function pointerReading(event: PointerEvent & { currentTarget: HTMLButtonElement }, metric: Metric, forecast = false)
+  function pointerReading(event: PointerEvent & { currentTarget: HTMLButtonElement }, metric: QuotaMetric, forecast = false)
   {
     if (event.pointerType !== 'mouse') return;
     const anchor = event.currentTarget;
@@ -202,18 +213,21 @@
   function leave()
   {
     cancelTimers();
-    if (!pinned && !(active?.forecast && active.anchor.matches(':focus-visible'))) closing = setTimeout(dismiss, 170);
+    if (pinned || !active || (active.forecast && active.anchor.matches(':focus-visible'))) return;
+    closing = setTimeout(dismiss, active.forecast ? 170 : 600);
   }
 
-  function select(metric: Metric, anchor: HTMLButtonElement)
+  function select(metric: QuotaMetric, event: MouseEvent & { currentTarget: HTMLButtonElement })
   {
+    const anchor = event.currentTarget;
     if (pinned && active?.anchor === anchor) { dismiss(); return; }
     cancelTimers();
     pinned = true;
-    void open(metric, anchor);
+    const keyboard = event.detail === 0;
+    if (active?.anchor !== anchor || keyboard) void open(metric, anchor, false, keyboard);
   }
 
-  function showForecast(metric: Metric, anchor: HTMLButtonElement)
+  function showForecast(metric: QuotaMetric, anchor: HTMLButtonElement)
   {
     cancelTimers();
     pinned = false;
@@ -237,30 +251,36 @@
   function dismiss()
   {
     cancelTimers();
-    if (card?.matches(':popover-open')) card.hidePopover();
+    if (forecastTip?.matches(':popover-open')) forecastTip.hidePopover();
     active = null;
+    historyTop = null;
     pinned = false;
   }
 
   function outside(event: PointerEvent)
   {
-    if (active && event.target instanceof Node && !active.anchor.contains(event.target) && !card?.contains(event.target)) dismiss();
+    const target = event.target;
+    if (!active || !(target instanceof Node) || active.anchor.contains(target) || forecastTip?.contains(target)) return;
+    // A title-bar drag should move a pinned card along with the window.
+    if (pinned && target instanceof Element && target.hasAttribute('data-tauri-drag-region')) return;
+    dismiss();
   }
 
   function escape(event: KeyboardEvent)
   {
     if (event.key !== 'Escape' || !active) return;
     event.preventDefault();
-    const anchor = active.anchor;
-    const restore = card?.contains(document.activeElement);
-    // Removing the popover can expose another quota under a stationary pointer.
+    closeAndRestoreFocus();
+  }
+
+  function closeAndRestoreFocus()
+  {
+    const anchor = active?.forecast ? undefined : active?.anchor;
+    // Restoring focus can expose another quota row under a stationary pointer.
     hoverBlocked = true;
     dismiss();
-    if (restore)
-    {
-      anchor.focus({ preventScroll: true });
-      cancelTimers();
-    }
+    anchor?.focus({ preventScroll: true });
+    cancelTimers();
   }
 </script>
 
@@ -271,10 +291,10 @@
   {@const resetting = resetState[JSON.stringify(metric.key)]}
   <div class="limits-window">
     <button class="limits-reading" type="button" aria-label={metric.label + ' · ' + metric.current}
-      aria-controls="quota-history-card" aria-expanded={activeKey === JSON.stringify(metric.key)}
+      aria-haspopup="dialog" aria-expanded={activeKey === JSON.stringify(metric.key)}
       onpointerenter={event => pointerReading(event, metric)} onpointermove={event => pointerReading(event, metric)}
       onpointerleave={leave} onfocus={event => hover(metric, event.currentTarget, 0)} onblur={leave}
-      onclick={event => select(metric, event.currentTarget)}>
+      onclick={event => select(metric, event)}>
       <span class="limits-reading-line">
         <span>{duration(window) || local('Quota', '额度')}</span><b>{metric.current}</b>
       </span>
@@ -286,7 +306,7 @@
         <span aria-live="polite">{forecastLabel(window, tracked[provider.tool], now)}</span>
         <button class="quota-banked-info forecast-info" type="button"
           aria-label={metric.label + ' · ' + local('Usage this cycle', '本周期已用量')}
-          aria-describedby={active?.forecast && active.metric.label === metric.label && active.metric.key.tool === provider.tool ? 'quota-history-card' : undefined}
+          aria-describedby={active?.forecast && active.metric.label === metric.label && active.metric.key.tool === provider.tool ? 'quota-forecast-tooltip' : undefined}
           onpointerenter={event => pointerReading(event, metric, true)} onpointermove={event => pointerReading(event, metric, true)} onpointerleave={leave}
           onfocus={event => showForecast(metric, event.currentTarget)} onblur={leave}
           onclick={event => showForecast(metric, event.currentTarget)}>!</button>
@@ -331,10 +351,10 @@
       {#each provider.balances as balance (balance.currency)}
         {@const metric = balanceMetric(provider, balance)}
         <button class="limits-reading limits-balance" type="button" aria-label={metric.label + ' · ' + metric.current}
-          aria-controls="quota-history-card" aria-expanded={activeKey === JSON.stringify(metric.key)}
+          aria-haspopup="dialog" aria-expanded={activeKey === JSON.stringify(metric.key)}
           onpointerenter={event => pointerReading(event, metric)} onpointermove={event => pointerReading(event, metric)}
           onpointerleave={leave} onfocus={event => hover(metric, event.currentTarget, 0)} onblur={leave}
-          onclick={event => select(metric, event.currentTarget)}>
+          onclick={event => select(metric, event)}>
           <span class="limits-reading-line"><span>{local('API balance', 'API 余额')}</span><b>{metric.current}</b></span>
         </button>
       {/each}
@@ -346,9 +366,8 @@
   {/each}
 </section>
 
-<div id="quota-history-card" class="quota-history-card" class:forecast-tip={active?.forecast} popover="manual" bind:this={card}
-  role={active?.forecast ? 'tooltip' : 'region'} aria-label={active?.forecast ? local('Usage this cycle', '本周期已用量') : local('Quota history', '额度使用记录')}
-  style:--row-ink={visibleMetric ? toolInfo(visibleMetric.key.tool).color : undefined}
+<div id="quota-forecast-tooltip" class="forecast-tip" popover="manual" bind:this={forecastTip}
+  role="tooltip" aria-label={local('Usage this cycle', '本周期已用量')}
   onpointerenter={cancelTimers} onpointerleave={leave} onfocusin={cancelTimers}>
   {#if active?.forecast && activeWindow}
     {#if forecast}
@@ -376,9 +395,5 @@
     {#if activeWindow.forecastResetAt != null}
       <small>{local('Forecast reset ', '预测重置于 ')}{time(activeWindow.forecastResetAt)}</small>
     {/if}
-  {:else if visibleMetric}
-    {#key JSON.stringify(visibleMetric.key)}
-      <QuotaHistoryCard name={toolInfo(visibleMetric.key.tool).name} {...visibleMetric} {history} {failed} />
-    {/key}
   {/if}
 </div>

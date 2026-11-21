@@ -27,7 +27,7 @@ Token Monitor Lite 受 Token Monitor 启发，是按个人的 Windows 本机用�
 
 从现存的工具日志重算。Codex 的原生日志目录包括 `sessions` 和 `archived_sessions`。Antigravity 读取 CLI、IDE 的会话数据库，包含 `.gemini/antigravity-ide` 和 `.gemini/antigravity-backup` 下的原生 SQLite。打开 Antigravity 后，发起模型请求才会产生当日 Token。旧 `.pb` 来源暂不可读，旧 Token Monitor 归档继续在 Electron 版查看。Lite 使用自己的 `%LOCALAPPDATA%\TokenMonitorLite` 数据目录，提示摘要按需从源记录读取。
 
-额度页按工具和模型显示剩余比例、余额和重置倒计时。同一模型的 5 小时和每周额度通常并排，空间不足时上下排列。悬停或点击某项额度，查看该项的剩余走势和近 14 天每日用量。每日用量来自本机观测到的变化，跨日的变化单独显示。Codex 可从近期本地日志补齐观测，其余工具从首次成功读取起积累。历史记录保存在 Lite 数据目录的 `quota-history.sqlite`。
+额度页按工具和模型显示剩余比例、余额和重置倒计时。同一模型的 5 小时和每周额度通常并排，空间不足时上下排列。悬停或点击某项额度，查看该项的剩余走势和近 14 天每日用量。图表卡片贴在主窗口侧边，与当前额度行对齐。每日用量来自本机观测到的变化，跨日的变化单独显示。Codex 可从近期本地日志补齐观测，其余工具从首次成功读取起积累。历史记录保存在 Lite 数据目录的 `quota-history.sqlite`。
 
 Codex 和 Antigravity 的 5 小时、每周窗口在重置时间下显示预计可用的 Token 总量和 API 等值美元。悬停或键盘聚焦圆形 `!`，可看本周期本机已记录的 Token（K／M／B 简写）和估价。启用该工具的用量采集和额度读取后，Lite 启动时取基线，之后随用量变化补采，按额度刷新间隔合并。托盘空闲期间，待补采的额度随用量检查一起处理。首次在后台从近 15 天的可读日志补建逐次用量，之后只重读变化的会话。
 
