@@ -41,13 +41,19 @@ pub enum QuotaRefresh
     IfStale,
     Panel,
     Manual,
+    TrayIdle,
 }
 
 impl QuotaRefresh
 {
     fn trigger(self) -> &'static str
     {
-        if self == Self::Manual { "manual" } else { "panel" }
+        match self
+        {
+            Self::IfStale | Self::Panel => "panel",
+            Self::Manual => "manual",
+            Self::TrayIdle => "tray_idle",
+        }
     }
 }
 
@@ -176,7 +182,9 @@ impl QuotaCache
             return Quotas::default();
         }
         self.refresh(settings, mode, || std::thread::scope(|scope| {
-            let codex = tools.codex.then(|| scope.spawn(|| {
+            // Idle checks use the online reading and cached fallback without walking session logs.
+            let read_sessions = tools.codex && mode != QuotaRefresh::TrayIdle;
+            let codex = read_sessions.then(|| scope.spawn(|| {
                 let cutoff = self.history.as_ref().map(|_| {
                     self.snapshot.lock().expect("quota snapshot").tools.iter()
                         .find(|quota| quota.tool == "codex" && !quota.windows.is_empty())
@@ -194,7 +202,7 @@ impl QuotaCache
                 Providers::default()
             };
             let (codex, history) = codex.map(|reader| reader.join().expect("Codex quota reader")).unwrap_or_default();
-            if tools.codex
+            if read_sessions
             {
                 if let Some(store) = &self.history { forecast::observe_account(store, sources, Utc::now().timestamp_millis()); }
             }
@@ -239,7 +247,7 @@ impl QuotaCache
             let online = fetch.map(|fetch| scope.spawn(fetch));
             if local_tools.any()
             {
-                self.sample_local(sources, local_tools, "startup");
+                self.sample_local(sources, local_tools, "startup", true);
                 changed();
             }
             let Some(online) = online else { return };
@@ -282,7 +290,7 @@ impl QuotaCache
         online_codex_quota(&sources.codex_auth(), "startup", &self.log)
     }
 
-    fn sample_local(&self, sources: &Sources, tools: ToolSelection, trigger: &str)
+    fn sample_local(&self, sources: &Sources, tools: ToolSelection, trigger: &str, poll_antigravity: bool)
     {
         let start = Instant::now();
         self.log.write(format_args!("quota sample trigger={trigger} result=started codex={} antigravity={}",
@@ -292,10 +300,10 @@ impl QuotaCache
             return;
         };
         let mut updates = Vec::new();
-        // Take the RPC snapshot first so the usage scan covers its observation time.
-        #[cfg(windows)]
-        if tools.antigravity
+        // Tray checks already fetch Antigravity. Startup and active sampling need their own RPC.
+        if tools.antigravity && poll_antigravity
         {
+            #[cfg(windows)]
             if sources.home_override.is_some()
             {
                 self.log.write(format_args!("quota read trigger={trigger} tool=antigravity source=local_rpc result=skipped reason=source_home_override"));
@@ -854,7 +862,7 @@ fn windows_quota(codex_auth: &Path, tools: ToolSelection, mode: QuotaRefresh, lo
             })
         };
         // The limits and reset inventory use separate HTTP requests and timeout budgets.
-        let usage = (tools.codex && mode == QuotaRefresh::Manual).then(|| scope.spawn(|| {
+        let usage = (tools.codex && matches!(mode, QuotaRefresh::Manual | QuotaRefresh::TrayIdle)).then(|| scope.spawn(|| {
             log.codex_online_result(trigger, online_codex_quota(codex_auth, trigger, log))
         }));
         let local = tools.antigravity.then(|| scope.spawn(|| antigravity::read(log, trigger)));

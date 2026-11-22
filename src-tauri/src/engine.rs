@@ -42,7 +42,7 @@ enum Signal
 {
     Scan(Period),
     Activity(bool, mpsc::Sender<Result<Activity, String>>),
-    Watched,
+    Wake,
     Interaction(Interaction),
     Resume,
     Quit,
@@ -164,9 +164,9 @@ impl Engine
 
     pub fn tracked_tools(&self) -> ToolSelection { self.preferences.get().collection.tools }
 
-    pub fn collection_changed(&self, period: Period, tools_changed: bool)
+    pub fn settings_changed(&self, period: Period, collection_tools_changed: bool)
     {
-        if tools_changed
+        if collection_tools_changed
         {
             // Requeue even if the old set is already being scanned.
             let _ = self.signals.send(Signal::Scan(Period::Today));
@@ -174,7 +174,7 @@ impl Engine
         }
         else
         {
-            let _ = self.signals.send(Signal::Watched);
+            let _ = self.signals.send(Signal::Wake);
         }
     }
 
@@ -320,7 +320,8 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
             {
                 if !work.receive(signal, &self.samples) { return; }
             }
-            let requested = self.preferences.get().collection;
+            let preferences = self.preferences.get();
+            let requested = preferences.collection;
             if settings != requested
             {
                 settings = requested;
@@ -346,19 +347,14 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
                 work.invalidate();
             }
             let now = Instant::now();
-            let idle_tick = settings.tools.any() && work.schedule.take_idle_check(now, settings.cadence);
-            let watch_due = {
-                let pending = *writes.lock().expect("watch timing");
-                let due = pending.filter(|_| work.schedule.active()).map(Writes::due);
-                // Pending quota samples can use a clean tray tick without opening the usage cache.
-                if due.is_some_and(|when| when <= now) ||
-                    (idle_tick && (pending.is_some() || work.invalidated || !self.watching.load(Ordering::Relaxed)))
-                {
-                    work.scan(Period::Today);
-                }
-                else if idle_tick { self.samples.collection_active(false); }
-                due
-            };
+            let pending = *writes.lock().expect("watch timing");
+            let watch_due = pending.filter(|_| work.schedule.active()).map(Writes::due);
+            if watch_due.is_some_and(|when| when <= now) { work.scan(Period::Today); }
+            let needs_scan = pending.is_some() || !self.watching.load(Ordering::Relaxed);
+            if work.check_tray(now, settings, needs_scan) && preferences.quotas.tools.any()
+            {
+                self.samples.tray_idle();
+            }
             if sync_needed || matches!(work.jobs.front(), Some(Job::Scan(Period::Today)))
             {
                 let covered = watcher.as_mut().is_some_and(|watcher| sync_roots(watcher, &roots, &mut watches));
@@ -404,7 +400,7 @@ impl<F: Fn(Period, u64, Option<Summary>)> Worker<F>
             }
             let now = Utc::now();
             let until_midnight = (next_midnight(now, today.zone) - now).to_std().unwrap_or(Duration::ZERO);
-            let idle_due = work.schedule.idle_deadline().filter(|_| settings.tools.any());
+            let idle_due = work.schedule.idle_deadline().filter(|_| settings.tools.any() || preferences.quotas.tools.any());
             let until_signal = watch_due.into_iter().chain(idle_due).min()
                 .map(|due| due.saturating_duration_since(Instant::now()))
                 .unwrap_or(until_midnight).min(until_midnight);
@@ -554,7 +550,7 @@ impl Work
         match signal
         {
             Signal::Quit => return false,
-            Signal::Watched => (),
+            Signal::Wake => (),
             Signal::Resume => self.invalidate(),
             Signal::Scan(period) => self.scan(period),
             Signal::Activity(force, reply) => self.jobs.push_back(Job::Activity(force, reply)),
@@ -572,6 +568,14 @@ impl Work
     {
         self.invalidated = true;
         if self.schedule.active() { self.scan(Period::Today); }
+    }
+
+    fn check_tray(&mut self, now: Instant, settings: CollectionSettings, needs_scan: bool) -> bool
+    {
+        if !self.schedule.take_idle_check(now, settings.cadence) { return false; }
+        // Every idle check can refresh quotas. Only dirty or unmonitored usage needs a scan.
+        if settings.tools.any() && (needs_scan || self.invalidated) { self.scan(Period::Today); }
+        true
     }
 
     fn scan(&mut self, period: Period)
@@ -605,7 +609,7 @@ fn open_watcher(
         else
         {
             *writes = Some(Writes { first: now, last: now });
-            let _ = sender.send(Signal::Watched);
+            let _ = sender.send(Signal::Wake);
         }
     }).ok()
 }
@@ -885,18 +889,39 @@ mod tests
         let mut work = Work::new();
         work.schedule.restart(start);
         let samples = UsageSignal::disconnected();
-        let cadence = CollectionSettings::default().cadence;
+        let settings = CollectionSettings::default();
         let mut checks = Vec::new();
 
         // Even a wakeup on every write must leave today's scan on the next idle slot.
         for second in 1..=60 * 60
         {
             let now = start + Duration::from_secs(second);
-            assert!(work.receive(Signal::Watched, &samples));
+            assert!(work.receive(Signal::Wake, &samples));
             assert!(!work.schedule.active() && work.jobs.is_empty());
-            if work.schedule.take_idle_check(now, cadence) { checks.push(second); }
+            if work.check_tray(now, settings, true)
+            {
+                checks.push(second);
+                assert!(matches!(work.jobs.pop_front(), Some(Job::Scan(Period::Today))));
+            }
+            assert!(work.jobs.is_empty());
         }
         assert_eq!(checks, [60, 240, 540, 1140, 2340, 3540]);
+    }
+
+    #[test]
+    fn idle_checks_continue_with_clean_logs_or_with_only_quotas_enabled()
+    {
+        let mut settings = CollectionSettings::default();
+        let start = Instant::now();
+        let mut work = Work::new();
+        work.schedule.restart(start);
+        assert!(work.check_tray(start + Duration::from_secs(60), settings, false));
+        assert!(work.jobs.is_empty());
+        settings.tools = ToolSelection { codex: false, antigravity: false, dsh: false };
+        // Quota-only mode has no watcher and still reaches the next idle check.
+        assert!(!work.check_tray(start + Duration::from_secs(239), settings, true));
+        assert!(work.check_tray(start + Duration::from_secs(240), settings, true));
+        assert!(work.jobs.is_empty());
     }
 
     #[test]

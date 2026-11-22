@@ -39,8 +39,8 @@
   const quotaSetup: Record<ToolId, { methods: string[]; instructions: string }> = $derived({
     codex: {
       methods: [local('Local logs', '本地日志'), 'OAuth'],
-      instructions: local('Sign in to Codex to fetch live quota windows at startup and on manual refresh, and to read Banked Reset. Automatic updates use local logs for quota windows.',
-        '登录 Codex 后，Lite 在启动和手动刷新时联网读取周期额度，也可查询 Banked Reset。日常自动更新从本机日志读取周期额度。')
+      instructions: local('Sign in to Codex to fetch live quota windows at startup, on manual refresh and at every idle tray check. Panel refreshes also read Banked Reset.',
+        '登录 Codex 后，Lite 会在启动、手动刷新和每次托盘空闲检查时联网读取周期额度。面板刷新时也会查询 Banked Reset。')
     },
     antigravity: {
       methods: ['RPC'],
@@ -193,8 +193,8 @@
                 {#each Object.entries(cadences) as [value, label] (value)}<option {value}>{label}</option>{/each}
               </select>
               <p id="collection-cadence-note" class="settings-note">
-                {local('Opening the window or hovering over the tray icon refreshes immediately and enables live updates. Idle checks start at 1 minute and gradually reach this limit.',
-                  '打开窗口或悬停托盘图标会立即刷新，并实时监看日志。收起窗口且鼠标离开后，从 1 分钟起逐步延长到此上限。')}
+                {local('Opening the window or hovering over the tray icon refreshes usage immediately. Idle checks start at 1 minute and gradually reach this limit. Each check refreshes enabled quotas and collects pending log changes.',
+                  '打开窗口或悬停托盘图标会立即刷新用量。收起窗口且鼠标离开后，检查间隔从 1 分钟起逐步延长到此上限。每次都查询已启用的额度，并合并采集期间的日志变化。')}
               </p>
             </div>
             <div class="settings-item">
@@ -266,7 +266,7 @@
                   <option value={minutes}>{local(`${minutes} min`, `${minutes} 分钟`)}</option>
                 {/each}
               </select>
-              <p class="settings-note">{local('Applies to the Home and Limits views.', '用于主页和额度页的刷新。')}</p>
+              <p class="settings-note">{local('Applies to the Home and Limits views. In the tray, quotas follow the idle check interval.', '用于主页和额度页的刷新。托盘空闲时，额度按托盘检查间隔查询。')}</p>
             </div>
           {/if}
           {#if open && errors.settings}

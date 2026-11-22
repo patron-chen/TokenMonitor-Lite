@@ -4,11 +4,11 @@ use std::{
 };
 
 use crate::{model::Summary, settings::{Preferences, PreferencesStore, ToolSelection}, sources::Sources};
-use super::QuotaCache;
+use super::{QuotaCache, QuotaRefresh};
 
 const TOOLS: [&str; 2] = ["codex", "antigravity"];
 
-enum Signal { Usage([u64; 2]), CollectionActive(bool), Settings, Stop }
+enum Signal { Usage([u64; 2]), CollectionActive(bool), TrayIdle, Settings, Stop }
 
 #[derive(Clone)]
 pub(crate) struct UsageSignal(Sender<Signal>);
@@ -24,6 +24,11 @@ impl UsageSignal
     pub fn collection_active(&self, active: bool)
     {
         let _ = self.0.send(Signal::CollectionActive(active));
+    }
+
+    pub fn tray_idle(&self)
+    {
+        let _ = self.0.send(Signal::TrayIdle);
     }
 
     pub fn updated(&self, summary: &Summary)
@@ -98,7 +103,7 @@ impl Sampler
         let (signal, receiver) = mpsc::channel();
         let target = cache.clone();
         let worker = thread::Builder::new().name("quota-sampler".into()).spawn(move || {
-            run(receiver, &target, &preferences, changed);
+            run(receiver, &target, &preferences, Sources::discover(), changed);
         })?;
         Ok((Self { signal: signal.clone(), cache, thread: Mutex::new(Some(worker)) }, UsageSignal(signal)))
     }
@@ -113,13 +118,12 @@ impl Sampler
     }
 }
 
-fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore, changed: impl Fn())
+fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore, sources: Sources, changed: impl Fn())
 {
-    let sources = Sources::discover();
     let mut schedule = Schedule::default();
     let mut active = false;
     let mut startup = true;
-    loop
+    while !cache.stopping.load(Ordering::Relaxed)
     {
         let settings = store.get();
         schedule.update(settings, None);
@@ -131,7 +135,7 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
             let codex_online = settings.quotas.tools.codex;
             let result = if tools.any() || codex_online { "scheduled" } else { "no_enabled_tools" };
             cache.log.write(format_args!(
-                "quota startup result={result} codex_collection={} codex_quota={} antigravity_collection={} antigravity_quota={} refresh_minutes={} codex_online={codex_online} banked_reset=panel_only",
+                "quota startup result={result} codex_collection={} codex_quota={} antigravity_collection={} antigravity_quota={} refresh_minutes={} codex_online={codex_online} banked_reset=skipped_at_startup",
                 settings.collection.tools.codex, settings.quotas.tools.codex,
                 settings.collection.tools.antigravity, settings.quotas.tools.antigravity, settings.quotas.refresh_minutes));
             cache.sample_startup(&sources, tools, codex_online.then(|| || cache.fetch_startup_codex(&sources)), &changed);
@@ -139,7 +143,7 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
         }
         else if tools.any()
         {
-            cache.sample_local(&sources, tools, "background");
+            cache.sample_local(&sources, tools, "background", active);
             changed();
         }
         let now = Instant::now();
@@ -152,6 +156,15 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
         {
             Ok(Signal::Usage(counts)) => schedule.update(store.get(), Some(counts)),
             Ok(Signal::CollectionActive(value)) => active = value,
+            Ok(Signal::TrayIdle) =>
+            {
+                let quotas = store.get().quotas;
+                if quotas.tools.any()
+                {
+                    cache.read(&sources, quotas, QuotaRefresh::TrayIdle);
+                    changed();
+                }
+            }
             Ok(Signal::Settings) | Err(RecvTimeoutError::Timeout) => (),
             Ok(Signal::Stop) | Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -162,6 +175,33 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn each_idle_signal_refreshes_quota_only_settings_inside_the_panel_interval()
+    {
+        let root = std::env::temp_dir().join(format!("token-monitor-tray-sampler-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = PreferencesStore::load(&root);
+        let mut settings = Preferences::default();
+        settings.collection.tools = ToolSelection { codex: false, antigravity: false, dsh: false };
+        settings.quotas.tools = ToolSelection { dsh: true, ..settings.collection.tools };
+        settings.quotas.refresh_minutes = 30;
+        store.save(settings).unwrap();
+        let cache = QuotaCache::default();
+        let (sender, receiver) = mpsc::channel();
+        let usage = UsageSignal(sender.clone());
+        usage.tray_idle();
+        usage.tray_idle();
+        sender.send(Signal::Stop).unwrap();
+
+        // No usage notification or panel request. The fixture isolates all provider calls.
+        let published = std::cell::Cell::new(0);
+        run(receiver, &cache, &store, Sources::from_home(Some(root.clone())), || published.set(published.get() + 1));
+        assert_eq!(published.get(), 2);
+        assert!(cache.cached(settings.quotas.tools).unwrap().checked_at.is_some());
+        std::fs::remove_file(root.join("settings.json")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn takes_a_baseline_then_coalesces_the_last_request_even_without_more_signals()

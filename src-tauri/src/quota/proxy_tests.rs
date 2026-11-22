@@ -12,7 +12,7 @@ use crate::app_log::{AppLog, LOG_FILE};
 use super::{parse_online_codex, powershell_json, QUOTA_SCRIPT, REMOTE_HELPER_TIMEOUT};
 
 #[test]
-fn only_a_manual_panel_request_starts_another_codex_usage_query()
+fn manual_and_idle_checks_query_codex_even_with_a_fresh_panel_cache()
 {
     use super::{QuotaCache, QuotaRefresh};
     use crate::{settings::{QuotaSettings, ToolSelection}, sources::Sources};
@@ -26,15 +26,20 @@ fn only_a_manual_panel_request_starts_another_codex_usage_query()
     sources.home_override = None;
     cache.read(&sources, settings, QuotaRefresh::Panel);
     cache.read(&sources, settings, QuotaRefresh::IfStale);
+    cache.read(&sources, settings, QuotaRefresh::TrayIdle);
+    cache.read(&sources, settings, QuotaRefresh::TrayIdle);
     cache.read(&sources, settings, QuotaRefresh::Manual);
     let disabled = ToolSelection { codex: false, ..tools };
     cache.read(&sources, QuotaSettings { tools: disabled, ..settings }, QuotaRefresh::Manual);
+    cache.read(&sources, QuotaSettings { tools: disabled, ..settings }, QuotaRefresh::TrayIdle);
 
     let log = root.join("logs").join(LOG_FILE);
     let trace = fs::read_to_string(&log).unwrap();
     assert_eq!(trace.matches("codex_usage trigger=manual auth result=file_missing").count(), 1);
-    assert_eq!(trace.matches("banked_reset auth result=file_missing").count(), 2);
+    assert_eq!(trace.matches("codex_usage trigger=tray_idle auth result=file_missing").count(), 2);
+    assert_eq!(trace.matches("banked_reset auth result=file_missing").count(), 4);
     assert!(!trace.contains("codex_usage trigger=panel"));
+    assert!(!trace.contains("quota scan trigger=tray_idle"));
     fs::remove_file(log).unwrap();
     fs::remove_dir(root.join("logs")).unwrap();
     fs::remove_dir(root).unwrap();

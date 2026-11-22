@@ -255,9 +255,9 @@ fn set_preferences(
     {
         app.state::<Sampler>().settings_changed();
     }
-    if previous.collection != preferences.collection
+    if previous.collection != preferences.collection || previous.quotas.tools.any() != preferences.quotas.tools.any()
     {
-        engine.collection_changed(period, previous.collection.tools != preferences.collection.tools);
+        engine.settings_changed(period, previous.collection.tools != preferences.collection.tools);
     }
     if previous.language != preferences.language
     {

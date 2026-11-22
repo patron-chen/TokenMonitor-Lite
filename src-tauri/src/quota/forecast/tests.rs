@@ -255,7 +255,7 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
     {
         if pass == 2 { fs::write(&live, &lines).unwrap(); }
         let cache = QuotaCache::new(&root, Arc::new(AppLog::new(&root)));
-        cache.sample_local(&sources, tools, "test");
+        cache.sample_local(&sources, tools, "test", true);
         let snapshot = cache.read(&sources, settings, QuotaRefresh::Panel);
         let values = &snapshot.tools[0].windows;
         assert_eq!(values.len(), 2);
