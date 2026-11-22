@@ -12,7 +12,7 @@ function Write-QuotaTrace([string]$Source, [string]$Message)
 }
 
 function Write-BankedResetTrace([string]$Message) { Write-QuotaTrace 'banked_reset' $Message }
-function Write-CodexUsageTrace([string]$Message) { Write-QuotaTrace 'codex_usage trigger=startup' $Message }
+function Write-CodexUsageTrace([string]$Message) { Write-QuotaTrace "codex_usage trigger=$env:TOKEN_MONITOR_LITE_QUOTA_TRIGGER" $Message }
 
 function Get-QuotaResponse([uri]$Uri, $Headers, [scriptblock]$Trace)
 {

@@ -11,6 +11,7 @@ export const toolIds = ['codex', 'antigravity', 'dsh'] as const;
 export type ToolId = typeof toolIds[number];
 export type ToolSelection = Record<ToolId, boolean>;
 export type Cadence = 'live' | '5m' | '15m' | '30m';
+export type QuotaRefresh = 'ifStale' | 'panel' | 'manual';
 export type UiLanguage = 'en' | 'zh-CN';
 export type Language = 'system' | UiLanguage;
 export type SettingsSection = 'appearance' | 'collection' | 'quotas';
@@ -247,7 +248,7 @@ export const backend = {
   dismiss: () => invoke<void>('dismiss_window'),
   summary: (period: Period) => invoke<Summary>('get_summary', { period }),
   activity: (force: boolean) => invoke<Activity>('get_activity', { force }),
-  quotas: (force: boolean) => invoke<Quotas>('get_quotas', { force }),
+  quotas: (mode: QuotaRefresh) => invoke<Quotas>('get_quotas', { mode }),
   bankedResetPanel: (limitsView: boolean, codexEnabled: boolean, readFailed: boolean, count: number | null, rendered: boolean,
     observedAt: [number | null, number | null]) =>
     invoke<void>('record_banked_reset_panel', { limitsView, codexEnabled, readFailed, count, rendered, observedAt }),

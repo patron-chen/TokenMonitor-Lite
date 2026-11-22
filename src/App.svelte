@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { backend, defaultPreferences, emptySessions, pageSize, toolIds } from './api';
   import type { Activity, Appearance, Backdrop, CollectionStatus, Detail, Period,
-    Preferences, Quotas, Session, SessionKey, SettingsSection, StatisticsRange, Summary, UiLanguage, View, ViewState } from './api';
+    Preferences, QuotaRefresh, Quotas, Session, SessionKey, SettingsSection, StatisticsRange, Summary, UiLanguage, View, ViewState } from './api';
   import { cacheHitLabel, callLabel, compact, cost, effortTitle, icons, local, modelIcon, number, requestPerformanceParts,
     sessionActivityParts, sessionKey, sessionModelLabel, sessionTitle, shortSessionTime, splits,
     statisticsRangeTabLabels, time, toolInfo, viewLabel, views } from './display';
@@ -47,7 +47,7 @@
   let activityRequest = 0;
   let activityError = $state(false);
   let quotas = $state<Quotas | null>(null);
-  let quotaLoading = $state(false);
+  let quotaLoading = $state<QuotaRefresh | null>(null);
   let quotaRequest = 0;
   let lastQuotaCheck = $state(0);
   let now = $state(Date.now());
@@ -178,7 +178,7 @@
       quotas = previous.cachedQuotas ?? null;
       lastQuotaCheck = quotas?.checkedAt ?? 0;
       ready = true;
-      loadViewExtras(true);
+      loadViewExtras('panel');
       if (route.period !== 'today') await backend.refresh(route.period);
       await refreshScreen();
       await tick();
@@ -191,11 +191,11 @@
     }
   }
 
-  function loadViewExtras(refreshQuotas = false)
+  function loadViewExtras(mode: QuotaRefresh = 'ifStale')
   {
     if (route.selection) return;
     if (route.view === 'home') void loadActivity();
-    if (quotaVisible) void loadQuotas(refreshQuotas);
+    if (quotaVisible) void loadQuotas(mode);
   }
 
   function localDay()
@@ -232,24 +232,24 @@
       [codex?.windows.length ? codex.observedAt : null, antigravity?.observedAt ?? null]).catch(() => {});
   }
 
-  async function loadQuotas(force = false)
+  async function loadQuotas(mode: QuotaRefresh = 'ifStale')
   {
-    if (!quotaVisible) return;
+    if (!quotaVisible && mode !== 'manual') return;
     if (!toolIds.some(tool => preferences.quotas.tools[tool]))
     {
       quotaRequest++;
       quotas = null;
-      quotaLoading = false;
+      quotaLoading = null;
       void recordBankedResetPanel(quotaRequest, false);
       return;
     }
-    if (quotaLoading && !force) return;
+    if (quotaLoading && mode === 'ifStale') return;
     const request = ++quotaRequest;
     let readFailed = false;
-    quotaLoading = true;
+    quotaLoading = mode;
     try
     {
-      const data = await backend.quotas(force);
+      const data = await backend.quotas(mode);
       if (request !== quotaRequest) return;
       applyQuotas(data);
     }
@@ -263,7 +263,7 @@
     {
       if (request === quotaRequest)
       {
-        quotaLoading = false;
+        quotaLoading = null;
         void recordBankedResetPanel(request, readFailed);
       }
     }
@@ -353,7 +353,7 @@
       if (settingsOpen && settingsSection === 'collection') void loadCollection();
       if (quotaVisible && toolIds.some(tool => next.quotas.tools[tool] !== previous.quotas.tools[tool]))
       {
-        void loadQuotas(true);
+        void loadQuotas('panel');
       }
     }
     catch
@@ -761,11 +761,12 @@
 
   async function manualRefresh()
   {
+    // Start quota requests from every view, independently of the local usage scan.
+    void loadQuotas('manual');
     try
     {
       await backend.refresh(route.period);
       if (!route.selection && route.view === 'home') void loadActivity(true);
-      if (quotaVisible) void loadQuotas(true);
       await refreshScreen(true);
     }
     catch
@@ -883,7 +884,7 @@
 
   <div class="viewport" bind:this={viewport} onscroll={captureScroll}>
     {#if !route.selection && route.view === 'home'}
-      <QuotaSection data={shownQuotas} loading={quotaLoading} {now}
+      <QuotaSection data={shownQuotas} loading={!!quotaLoading} {now}
         openLimits={tool => chooseView('limits', true, tool ?? null)} />
     {/if}
     {#if route.selection}
@@ -964,7 +965,7 @@
     {:else if !summary?.updatedAt}
       {#if !error && !summary?.failure}<p class="notice" role="status">{local('Reading local usage…', '正在读取本地用量…')}</p>{/if}
     {:else if route.view === 'limits'}
-      <QuotaView data={shownQuotas} loading={quotaLoading} {now} focusTool={route.expanded}
+      <QuotaView data={shownQuotas} loading={!!quotaLoading} {now} focusTool={route.expanded}
         tracked={preferences.collection.tools} fontScale={appearance.fontScale} onUpdate={applyQuotas} />
     {:else if route.view === 'tools'}
       <BreakdownRows rows={summary.tools} kind="tool" mode={route.toolMode} expanded={route.expanded} activate={expand} />
@@ -1081,7 +1082,7 @@
         <button aria-pressed={route.toolMode === 'models'} onclick={() => { route.toolMode = 'models'; remember(); }}>{viewLabel('models')}</button>
       </div>
     {/if}
-    <button class="icon-button refresh" class:working={summary?.refreshing} disabled={summary?.refreshing || !ready}
+    <button class="icon-button refresh" class:working={summary?.refreshing || quotaLoading === 'manual'} disabled={!ready || quotaLoading === 'manual'}
       aria-label={local('Refresh', '刷新')} title={local('Refresh', '刷新')} onclick={manualRefresh}>
       <span class="icon" style:--icon={'url(' + icons.refresh + ')'} aria-hidden="true"></span>
     </button>

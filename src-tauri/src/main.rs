@@ -32,7 +32,7 @@ use detail::{Detail, Sort};
 use engine::{current_span, CollectionStatus, Engine, Interaction, Update};
 use model::{Activity, Period, SessionPage, Summary};
 use popover::Popover;
-use quota::{QuotaCache, Quotas};
+use quota::{QuotaCache, QuotaRefresh, Quotas};
 use quota::sampler::Sampler;
 use quota_history::{HistoryPreview, QuotaKey};
 use settings::{Language, Preferences, PreferencesStore};
@@ -337,14 +337,13 @@ async fn get_activity(engine: State<'_, Arc<Engine>>, force: bool) -> Result<Act
 }
 
 #[tauri::command]
-async fn get_quotas(
-    engine: State<'_, Arc<Engine>>, quotas: State<'_, Arc<QuotaCache>>, store: State<'_, Arc<PreferencesStore>>, force: bool,
-) -> Result<Quotas, String>
+async fn get_quotas(app: AppHandle, mode: QuotaRefresh) -> Result<Quotas, String>
 {
-    let sources = engine.sources.clone();
-    let quotas = quotas.inner().clone();
-    let settings = store.get().quotas;
-    tauri::async_runtime::spawn_blocking(move || quotas.read(&sources, settings, force)).await.map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let engine = app.state::<Arc<Engine>>();
+        let settings = app.state::<Arc<PreferencesStore>>().get().quotas;
+        app.state::<Arc<QuotaCache>>().read(&engine.sources, settings, mode)
+    }).await.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -585,7 +584,17 @@ fn main()
                 .on_menu_event(|app, event| match event.id().as_ref()
                 {
                     "open" => open(app, None),
-                    "refresh" => app.state::<Arc<Engine>>().interact(Interaction::Refresh),
+                    "refresh" =>
+                    {
+                        app.state::<Arc<Engine>>().interact(Interaction::Refresh);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Ok(snapshot) = get_quotas(app.clone(), QuotaRefresh::Manual).await
+                            {
+                                let _ = app.emit_to(WINDOW, "quota-forecast-updated", snapshot);
+                            }
+                        });
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })

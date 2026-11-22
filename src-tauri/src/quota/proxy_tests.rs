@@ -12,6 +12,35 @@ use crate::app_log::{AppLog, LOG_FILE};
 use super::{parse_online_codex, powershell_json, QUOTA_SCRIPT, REMOTE_HELPER_TIMEOUT};
 
 #[test]
+fn only_a_manual_panel_request_starts_another_codex_usage_query()
+{
+    use super::{QuotaCache, QuotaRefresh};
+    use crate::{settings::{QuotaSettings, ToolSelection}, sources::Sources};
+
+    let root = std::env::temp_dir().join(format!("token-monitor-manual-quota-{}", std::process::id()));
+    let cache = QuotaCache { log: std::sync::Arc::new(AppLog::new(&root)), ..QuotaCache::default() };
+    let tools = ToolSelection { codex: true, antigravity: false, dsh: false };
+    let settings = QuotaSettings { tools, ..QuotaSettings::default() };
+    // Keep all source paths in the fixture. Missing auth stops each real helper before HTTP.
+    let mut sources = Sources::from_home(Some(root.clone()));
+    sources.home_override = None;
+    cache.read(&sources, settings, QuotaRefresh::Panel);
+    cache.read(&sources, settings, QuotaRefresh::IfStale);
+    cache.read(&sources, settings, QuotaRefresh::Manual);
+    let disabled = ToolSelection { codex: false, ..tools };
+    cache.read(&sources, QuotaSettings { tools: disabled, ..settings }, QuotaRefresh::Manual);
+
+    let log = root.join("logs").join(LOG_FILE);
+    let trace = fs::read_to_string(&log).unwrap();
+    assert_eq!(trace.matches("codex_usage trigger=manual auth result=file_missing").count(), 1);
+    assert_eq!(trace.matches("banked_reset auth result=file_missing").count(), 2);
+    assert!(!trace.contains("codex_usage trigger=panel"));
+    fs::remove_file(log).unwrap();
+    fs::remove_dir(root.join("logs")).unwrap();
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
 fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -91,6 +120,7 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
         ("ALL_PROXY", "http://127.0.0.1:1".as_ref()), ("NO_PROXY", "".as_ref()),
         ("QUOTA_TEST_ORIGIN", origin.as_ref()),
         ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex_usage,codex,dsh".as_ref()),
+        ("TOKEN_MONITOR_LITE_QUOTA_TRIGGER", "manual".as_ref()),
         ("TOKEN_MONITOR_LITE_CODEX_AUTH", auth.as_os_str()), ("DEEPSEEK_API_KEY", "deepseek-fixture".as_ref()),
     ], REMOTE_HELPER_TIMEOUT, &log);
     fs::remove_file(auth).unwrap();
@@ -122,8 +152,8 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
     for expected in ["route source=proxy-server", "client=winhttp proxy_scheme=http proxy_loopback=True",
         "winhttp phase=send timeout_ms=20000", "winhttp phase=wait", "http status=200",
         "response count_field=available_count count=3", "route source=HTTP_PROXY",
-        "transport client=curl", "curl exit=0 http=200", "codex_usage trigger=startup route source=proxy-server",
-        "codex_usage trigger=startup http status=200"]
+        "transport client=curl", "curl exit=0 http=200", "codex_usage trigger=manual route source=proxy-server",
+        "codex_usage trigger=manual http status=200"]
     {
         assert!(trace.contains(expected), "missing {expected} in {trace}");
     }
@@ -207,6 +237,7 @@ Write-Output 'true'
     let result: Result<bool, _> = powershell_json(&script, &[
         ("TOKEN_MONITOR_LITE_CODEX_AUTH", auth.as_os_str()),
         ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "".as_ref()),
+        ("TOKEN_MONITOR_LITE_QUOTA_TRIGGER", "startup".as_ref()),
     ], Duration::from_secs(12), &log);
     let logs = root.join("logs");
     let trace = fs::read_to_string(logs.join(LOG_FILE)).unwrap();

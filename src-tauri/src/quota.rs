@@ -34,6 +34,23 @@ const REMOTE_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const CODEX_HISTORY_LIMIT: usize = 1200;
 
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QuotaRefresh
+{
+    IfStale,
+    Panel,
+    Manual,
+}
+
+impl QuotaRefresh
+{
+    fn trigger(self) -> &'static str
+    {
+        if self == Self::Manual { "manual" } else { "panel" }
+    }
+}
+
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Quotas
@@ -90,6 +107,23 @@ struct BankedReset
 
 impl AppLog
 {
+    fn codex_online_result(&self, trigger: &str, result: Result<ToolQuota, String>) -> Option<ToolQuota>
+    {
+        match result
+        {
+            Ok(row) =>
+            {
+                self.reading(trigger, "codex", "online", "read", Some(&row));
+                Some(row)
+            }
+            Err(reason) =>
+            {
+                self.write(format_args!("quota read trigger={trigger} tool=codex source=online result=failed reason={reason}"));
+                None
+            }
+        }
+    }
+
     fn reading(&self, trigger: &str, tool: &str, source: &str, result: &str, quota: Option<&ToolQuota>)
     {
         if let Some(quota) = quota
@@ -132,30 +166,31 @@ impl QuotaCache
         (snapshot.checked_at.is_some() || !snapshot.tools.is_empty()).then(|| snapshot.for_tools(tools))
     }
 
-    pub fn read(&self, sources: &Sources, settings: QuotaSettings, force: bool) -> Quotas
+    pub fn read(&self, sources: &Sources, settings: QuotaSettings, mode: QuotaRefresh) -> Quotas
     {
         let tools = settings.tools;
+        let trigger = mode.trigger();
         if !tools.any()
         {
-            self.log.write(format_args!("quota refresh trigger=panel result=no_enabled_tools"));
+            self.log.write(format_args!("quota refresh trigger={trigger} result=no_enabled_tools"));
             return Quotas::default();
         }
-        self.refresh(settings, force, || std::thread::scope(|scope| {
+        self.refresh(settings, mode, || std::thread::scope(|scope| {
             let codex = tools.codex.then(|| scope.spawn(|| {
                 let cutoff = self.history.as_ref().map(|_| {
                     self.snapshot.lock().expect("quota snapshot").tools.iter()
                         .find(|quota| quota.tool == "codex" && !quota.windows.is_empty())
                         .map_or_else(|| Utc::now().timestamp_millis() - RETENTION_MS, |quota| quota.observed_at)
                 });
-                codex_quota(&sources.codex_sessions(), cutoff, &self.log, "panel")
+                codex_quota(&sources.codex_sessions(), cutoff, &self.log, trigger)
             }));
             let providers = if sources.home_override.is_none()
             {
-                windows_quota(&sources.codex_auth(), tools, &self.log)
+                windows_quota(&sources.codex_auth(), tools, mode, &self.log)
             }
             else
             {
-                self.log.write(format_args!("quota refresh trigger=panel live_requests=skipped reason=source_home_override"));
+                self.log.write(format_args!("quota refresh trigger={trigger} live_requests=skipped reason=source_home_override"));
                 Providers::default()
             };
             let (codex, history) = codex.map(|reader| reader.join().expect("Codex quota reader")).unwrap_or_default();
@@ -209,17 +244,15 @@ impl QuotaCache
             }
             let Some(online) = online else { return };
             let tools = ToolSelection { codex: true, antigravity: false, dsh: false };
-            match online.join().expect("startup Codex quota reader")
+            match self.log.codex_online_result("startup", online.join().expect("startup Codex quota reader"))
             {
-                Ok(row) =>
+                Some(row) =>
                 {
-                    self.log.reading("startup", "codex", "online", "read", Some(&row));
                     self.publish_samples(tools, "startup", vec![row], start);
                     changed();
                 }
-                Err(reason) =>
+                None =>
                 {
-                    self.log.write(format_args!("quota read trigger=startup tool=codex source=online result=failed reason={reason}"));
                     let local = self.snapshot.lock().expect("quota snapshot").tools.iter()
                         .find(|row| row.tool == "codex" && !row.windows.is_empty()).cloned();
                     if let Some(row) = local
@@ -246,8 +279,7 @@ impl QuotaCache
     fn fetch_startup_codex(&self, sources: &Sources) -> Result<ToolQuota, String>
     {
         if sources.home_override.is_some() { return Err("source_home_override".into()); }
-        self.log.reading("startup", "codex", "online", "started", None);
-        online_codex_quota(&sources.codex_auth(), &self.log)
+        online_codex_quota(&sources.codex_auth(), "startup", &self.log)
     }
 
     fn sample_local(&self, sources: &Sources, tools: ToolSelection, trigger: &str)
@@ -368,24 +400,39 @@ impl QuotaCache
     }
 
     fn refresh(
-        &self, settings: QuotaSettings, force: bool,
+        &self, settings: QuotaSettings, mode: QuotaRefresh,
         collect: impl FnOnce() -> (Option<ToolQuota>, Providers, Vec<Sample>),
     ) -> Quotas
     {
-        // Opening a WebView can read the last snapshot while I/O is in flight.
-        let queued = Instant::now();
-        let mut refreshed = self.refreshed.lock().expect("quota refresh");
-        let ttl = Duration::from_secs(u64::from(settings.refresh_minutes) * 60);
-        let tools = settings.tools;
-        self.log.write(format_args!("refresh force={force} codex_enabled={} trigger=panel antigravity_enabled={} dsh_enabled={} queue_ms={}",
-            tools.codex, tools.antigravity, tools.dsh, queued.elapsed().as_millis()));
-        if !force && refreshed.is_some_and(|(at, tools)| tools == settings.tools && at.elapsed() < ttl)
-        {
-            self.log.write(format_args!("refresh result=cache_hit"));
-            return self.cached(settings.tools).unwrap_or_default();
-        }
         let start = Instant::now();
-        let (codex, providers, mut samples) = collect();
+        let trigger = mode.trigger();
+        let tools = settings.tools;
+        let lock = ||
+        {
+            let queued = Instant::now();
+            let guard = self.refreshed.lock().expect("quota refresh");
+            self.log.write(format_args!("refresh force={} codex_enabled={} trigger={trigger} antigravity_enabled={} dsh_enabled={} queue_ms={}",
+                mode != QuotaRefresh::IfStale, tools.codex, tools.antigravity, tools.dsh, queued.elapsed().as_millis()));
+            guard
+        };
+        let (mut refreshed, readings) = if mode == QuotaRefresh::Manual
+        {
+            // A click can arrive while the panel's automatic requests are still in flight.
+            let readings = collect();
+            (lock(), readings)
+        }
+        else
+        {
+            let refreshed = lock();
+            let ttl = Duration::from_secs(u64::from(settings.refresh_minutes) * 60);
+            if mode == QuotaRefresh::IfStale && refreshed.is_some_and(|(at, prior)| prior == tools && at.elapsed() < ttl)
+            {
+                self.log.write(format_args!("refresh result=cache_hit"));
+                return self.cached(tools).unwrap_or_default();
+            }
+            (refreshed, collect())
+        };
+        let (codex, providers, mut samples) = readings;
         let observed_at = Utc::now().timestamp_millis();
         let mut snapshot = self.snapshot.lock().expect("quota snapshot").clone();
         let previous = snapshot.observation_times();
@@ -394,7 +441,7 @@ impl QuotaCache
         {
             if history.record(&samples, observed_at).is_err()
             {
-                self.log.write(format_args!("quota history trigger=panel result=write_failed"));
+                self.log.write(format_args!("quota history trigger={trigger} result=write_failed"));
                 eprintln!("Could not save the local quota history.");
             }
             forecast::attach(history, &mut snapshot.tools, settings.tools, observed_at);
@@ -402,7 +449,7 @@ impl QuotaCache
         *refreshed = Some((Instant::now(), settings.tools));
         let result = snapshot.for_tools(settings.tools);
         *self.snapshot.lock().expect("quota snapshot") = snapshot;
-        self.log_publication("panel", tools, previous, result.observation_times(), start.elapsed());
+        self.log_publication(trigger, tools, previous, result.observation_times(), start.elapsed());
         if settings.tools.codex
         {
             let bank = result.tools.iter().find(|row| row.tool == "codex").and_then(|row| row.banked_reset.as_ref());
@@ -435,6 +482,7 @@ impl Quotas
         self.checked_at = Some(now);
         let previous = |tool| self.tools.iter().find(|quota| quota.tool == tool).cloned();
         let previous_codex = previous("codex");
+        let codex = providers.codex_usage.or(codex);
         let antigravity = providers.antigravity;
         let deepseek = deepseek_quota(&providers.deepseek, now);
         let bank = parse_banked_reset(&providers.codex_reset, now);
@@ -647,8 +695,8 @@ struct Providers
 {
     #[serde(skip)]
     antigravity: Option<ToolQuota>,
-    #[cfg(windows)]
-    codex_usage: Value,
+    #[serde(skip)]
+    codex_usage: Option<ToolQuota>,
     codex_reset: Value,
     deepseek: Value,
 }
@@ -774,22 +822,26 @@ fn deepseek_quota(data: &Value, observed_at: i64) -> Option<ToolQuota>
 }
 
 #[cfg(windows)]
-fn online_codex_quota(codex_auth: &Path, log: &AppLog) -> Result<ToolQuota, String>
+fn online_codex_quota(codex_auth: &Path, trigger: &str, log: &AppLog) -> Result<ToolQuota, String>
 {
-    let providers: Providers = powershell_json(QUOTA_SCRIPT, &[
+    log.reading(trigger, "codex", "online", "started", None);
+    let providers: Value = powershell_json(QUOTA_SCRIPT, &[
         ("TOKEN_MONITOR_LITE_CODEX_AUTH", codex_auth.as_os_str()),
         ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex_usage".as_ref()),
+        ("TOKEN_MONITOR_LITE_QUOTA_TRIGGER", trigger.as_ref()),
     ], REMOTE_HELPER_TIMEOUT, log)?;
-    if let Some(reason) = providers.codex_usage["error"].as_str() { return Err(reason.into()); }
-    parse_online_codex(&providers.codex_usage, Utc::now().timestamp_millis()).ok_or_else(|| "no_usable_windows".into())
+    let usage = &providers["codex_usage"];
+    if let Some(reason) = usage["error"].as_str() { return Err(reason.into()); }
+    parse_online_codex(usage, Utc::now().timestamp_millis()).ok_or_else(|| "no_usable_windows".into())
 }
 
 #[cfg(not(windows))]
-fn online_codex_quota(_: &Path, _: &AppLog) -> Result<ToolQuota, String> { Err("unsupported_platform".into()) }
+fn online_codex_quota(_: &Path, _: &str, _: &AppLog) -> Result<ToolQuota, String> { Err("unsupported_platform".into()) }
 
 #[cfg(windows)]
-fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &AppLog) -> Providers
+fn windows_quota(codex_auth: &Path, tools: ToolSelection, mode: QuotaRefresh, log: &AppLog) -> Providers
 {
+    let trigger = mode.trigger();
     std::thread::scope(|scope| {
         let remote = |tool: &str| -> Providers {
             powershell_json(QUOTA_SCRIPT, &[
@@ -801,21 +853,25 @@ fn windows_quota(codex_auth: &Path, tools: ToolSelection, log: &AppLog) -> Provi
                 Providers::default()
             })
         };
-        let local = tools.antigravity.then(|| scope.spawn(|| antigravity::read(log, "panel")));
+        // The limits and reset inventory use separate HTTP requests and timeout budgets.
+        let usage = (tools.codex && mode == QuotaRefresh::Manual).then(|| scope.spawn(|| {
+            log.codex_online_result(trigger, online_codex_quota(codex_auth, trigger, log))
+        }));
+        let local = tools.antigravity.then(|| scope.spawn(|| antigravity::read(log, trigger)));
         let read_balance = tools.dsh && ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"].iter()
             .any(|name| std::env::var_os(name).is_some_and(|key| !key.is_empty()));
         if tools.dsh && !read_balance
         {
-            log.write(format_args!("quota read trigger=panel tool=dsh source=api result=skipped reason=no_api_key"));
+            log.write(format_args!("quota read trigger={trigger} tool=dsh source=api result=skipped reason=no_api_key"));
         }
         // A slow balance request must not consume the reset request's deadline or discard its result.
         let balance = read_balance.then(|| scope.spawn(move || remote("dsh").deepseek));
         let codex_reset = if tools.codex { remote("codex").codex_reset } else { Value::Null };
         Providers {
             antigravity: local.and_then(|worker| worker.join().expect("Antigravity quota reader")),
+            codex_usage: usage.and_then(|worker| worker.join().expect("Codex quota reader")),
             codex_reset,
             deepseek: balance.map(|worker| worker.join().expect("DeepSeek quota reader")).unwrap_or_default(),
-            ..Providers::default()
         }
     })
 }
@@ -871,7 +927,7 @@ fn powershell_json<T: serde::de::DeserializeOwned + Send>(
 }
 
 #[cfg(not(windows))]
-fn windows_quota(_: &Path, _: ToolSelection, _: &AppLog) -> Providers { Providers::default() }
+fn windows_quota(_: &Path, _: ToolSelection, _: QuotaRefresh, _: &AppLog) -> Providers { Providers::default() }
 
 #[cfg(test)]
 mod tests
@@ -912,12 +968,12 @@ mod tests
                 "rate_limits":{"primary":{"used_percent":used,"window_minutes":10080}}
             }
         }));
-        cache.refresh(settings, true, || (codex(25, "2026-11-20T00:00:00Z"), Providers {
+        cache.refresh(settings, QuotaRefresh::Panel, || (codex(25, "2026-11-20T00:00:00Z"), Providers {
             codex_reset: json!({"available_count":2}),
             deepseek: json!({"balance_infos":[{"currency":"USD","total_balance":"5"}]}),
             ..Providers::default()
         }, vec![]));
-        let refreshed = cache.refresh(settings, true, || {
+        let refreshed = cache.refresh(settings, QuotaRefresh::Panel, || {
             assert!(cache.snapshot.try_lock().is_ok());
             assert_eq!(cache.cached(settings.tools).unwrap().tools[0].windows[0].remaining, 75.0);
             (codex(30, "2026-11-20T00:01:00Z"), Providers::default(), vec![])
@@ -925,18 +981,18 @@ mod tests
         assert_eq!(refreshed.tools[0].windows[0].remaining, 70.0);
         assert_eq!(refreshed.tools[0].banked_reset.as_ref().unwrap().available_count, 2);
         assert_eq!(refreshed.tools[1].balances[0].amount, 5.0);
-        let refreshed = cache.refresh(settings, true, || (None, Providers {
+        let refreshed = cache.refresh(settings, QuotaRefresh::Panel, || (None, Providers {
             codex_reset: json!({"available_count":0}),
             ..Providers::default()
         }, vec![]));
         assert_eq!(refreshed.tools[0].windows[0].remaining, 70.0);
         assert_eq!(refreshed.tools[0].banked_reset.as_ref().unwrap().available_count, 0);
         let without_codex = QuotaSettings { tools: ToolSelection { codex: false, ..settings.tools }, ..settings };
-        let just_balance = cache.refresh(without_codex, false, || (None, Providers::default(), vec![]));
+        let just_balance = cache.refresh(without_codex, QuotaRefresh::IfStale, || (None, Providers::default(), vec![]));
         assert!(just_balance.checked_at.is_some());
         assert_eq!(just_balance.tools.iter().map(|tool| tool.tool).collect::<Vec<_>>(), ["dsh"]);
         assert_eq!(cache.cached(settings.tools).unwrap().tools.len(), 2);
-        assert_eq!(cache.refresh(without_codex, false, || panic!("fresh selection was rescanned")).tools.len(), 1);
+        assert_eq!(cache.refresh(without_codex, QuotaRefresh::IfStale, || panic!("fresh selection was rescanned")).tools.len(), 1);
         let trace = fs::read_to_string(&log).unwrap();
         fs::remove_file(log).unwrap();
         fs::remove_dir(root.join("logs")).unwrap();
@@ -960,7 +1016,7 @@ mod tests
         let cache = QuotaCache::new(&root, Arc::new(AppLog::new(&root)));
         let tools = ToolSelection { codex: true, antigravity: false, dsh: false };
         let settings = QuotaSettings { tools, ..QuotaSettings::default() };
-        assert!(cache.read(&sources, settings, true).tools.is_empty());
+        assert!(cache.read(&sources, settings, QuotaRefresh::Panel).tools.is_empty());
 
         let at = Utc::now().timestamp_millis() - 3_600_000;
         let resets_at = at + 7 * 24 * 3_600_000;
@@ -974,7 +1030,7 @@ mod tests
         });
         fs::write(&rollout, format!("{event}\r\n")).unwrap();
         cache.sample_startup(&sources, tools, Some(|| Err("no_usage_response".into())), &|| {});
-        let snapshot = cache.read(&sources, settings, true);
+        let snapshot = cache.read(&sources, settings, QuotaRefresh::Panel);
         assert_eq!(snapshot.tools[0].observed_at, at);
         cache.record_banked_reset_panel(true, true, false, None, false, [Some(at), None]);
 
@@ -999,6 +1055,51 @@ mod tests
         fs::remove_dir(sources.codex_root()).unwrap();
         fs::remove_dir(root.join("logs")).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manual_refresh_starts_during_a_panel_read_and_uses_live_limits()
+    {
+        let cache = QuotaCache::default();
+        let settings = QuotaSettings::default();
+        let now = Utc::now().timestamp_millis();
+        let local = parse_codex(&json!({
+            "timestamp":now-60_000, "type":"event_msg", "payload":{"type":"token_count",
+                "rate_limits":{"primary":{"window_minutes":300,"used_percent":10}}}
+        }));
+        cache.refresh(settings, QuotaRefresh::Panel, || (local.clone(), Providers::default(), vec![]));
+        let live = parse_online_codex(&json!({"rate_limit":{
+            "primary_window":{"limit_window_seconds":18000,"used_percent":100},
+            "secondary_window":{"limit_window_seconds":604800,"used_percent":40}
+        }}), now).unwrap();
+        let (started, receiver) = std::sync::mpsc::channel();
+        let snapshot = std::thread::scope(|scope| {
+            let in_flight = cache.refreshed.lock().unwrap();
+            let manual = scope.spawn(|| cache.refresh(settings, QuotaRefresh::Manual, || {
+                started.send(()).unwrap();
+                (local.clone(), Providers {
+                    codex_usage: Some(live), codex_reset: json!({"available_count":2}),
+                    deepseek: json!({"balance_infos":[{"currency":"USD","total_balance":"3.50"}]}),
+                    ..Providers::default()
+                }, vec![])
+            }));
+            let dispatched = receiver.recv_timeout(Duration::from_secs(3));
+            drop(in_flight);
+            dispatched.expect("a manual click must start fetching before the previous panel read completes");
+            manual.join().unwrap()
+        });
+        let codex = &snapshot.tools[0];
+        assert_eq!(codex.source, Some("online"));
+        assert_eq!(codex.windows.iter().map(|w| (w.minutes, w.remaining)).collect::<Vec<_>>(),
+            [(Some(300), 0.0), (Some(10_080), 60.0)]);
+        assert_eq!(codex.banked_reset.as_ref().unwrap().available_count, 2);
+        assert_eq!(snapshot.tools[1].balances[0].amount, 3.5);
+
+        let fallback = cache.refresh(settings, QuotaRefresh::Manual, || (local, Providers::default(), vec![]));
+        assert_eq!(fallback.tools[0].observed_at, now);
+        assert_eq!(fallback.tools[0].windows[0].remaining, 0.0);
+        assert_eq!(fallback.tools[1].balances[0].amount, 3.5);
     }
 
     #[cfg(windows)]
@@ -1032,7 +1133,7 @@ mod tests
             "timestamp":now-1_000,"type":"event_msg","payload":{"type":"token_count",
             "rate_limits":{"primary":{"window_minutes":10080,"used_percent":85}}}
         }));
-        let panel = cache.refresh(QuotaSettings { tools, ..QuotaSettings::default() }, true,
+        let panel = cache.refresh(QuotaSettings { tools, ..QuotaSettings::default() }, QuotaRefresh::Panel,
             || (local, Providers::default(), vec![]));
         assert_eq!(panel.tools[0].source, Some("online"));
         assert_eq!(panel.tools[0].windows.len(), 2);

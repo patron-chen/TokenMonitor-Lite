@@ -143,7 +143,7 @@ fn manual_reset_relearns_from_new_pairs_and_keeps_all_cycle_usage()
 #[test]
 fn reset_persists_for_only_the_selected_tool_group_and_duration()
 {
-    use crate::{quota::{Providers, QuotaCache, Quotas}, settings::QuotaSettings};
+    use crate::{quota::{Providers, QuotaCache, QuotaRefresh, Quotas}, settings::QuotaSettings};
     use std::fs;
 
     let now = chrono::Utc::now().timestamp_millis();
@@ -180,7 +180,7 @@ fn reset_persists_for_only_the_selected_tool_group_and_duration()
             for w in &mut baseline.windows { w.remaining += 10.0; }
             baseline.samples(&mut samples);
         }
-        cache.refresh(QuotaSettings { tools, ..QuotaSettings::default() }, true,
+        cache.refresh(QuotaSettings { tools, ..QuotaSettings::default() }, QuotaRefresh::Panel,
             || (Some(codex), Providers { antigravity: Some(ag), ..Providers::default() }, samples))
     };
     let check = |snapshot: &Quotas, after_reset| {
@@ -221,7 +221,7 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
     use std::fs;
     use chrono::Utc;
     use serde_json::json;
-    use crate::{quota::QuotaCache, settings::QuotaSettings};
+    use crate::{quota::{QuotaCache, QuotaRefresh}, settings::QuotaSettings};
 
     let now = Utc::now().timestamp_millis();
     let root = std::env::temp_dir().join(format!("lite-quota-forecast-{}-{now}", std::process::id()));
@@ -256,7 +256,7 @@ fn archived_codex_requests_survive_restart_and_duplicate_active_rollouts()
         if pass == 2 { fs::write(&live, &lines).unwrap(); }
         let cache = QuotaCache::new(&root, Arc::new(AppLog::new(&root)));
         cache.sample_local(&sources, tools, "test");
-        let snapshot = cache.read(&sources, settings, true);
+        let snapshot = cache.read(&sources, settings, QuotaRefresh::Panel);
         let values = &snapshot.tools[0].windows;
         assert_eq!(values.len(), 2);
         let db = QuotaHistory::new(&root).connection().unwrap();

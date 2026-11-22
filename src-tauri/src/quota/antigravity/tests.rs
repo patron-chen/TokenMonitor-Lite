@@ -156,12 +156,12 @@ function Get-NetTCPConnection
 #[ignore = "requires a running Antigravity service with readable quota"]
 fn live_panel_quota()
 {
-    use crate::{quota::QuotaCache, settings::{QuotaSettings, ToolSelection}, sources::Sources};
+    use crate::{quota::{QuotaCache, QuotaRefresh}, settings::{QuotaSettings, ToolSelection}, sources::Sources};
 
     let cache = QuotaCache::default();
     let settings = QuotaSettings { tools: ToolSelection { antigravity: true, codex: false, dsh: false },
         ..QuotaSettings::default() };
-    let snapshot = cache.read(&Sources::discover(), settings, false);
+    let snapshot = cache.read(&Sources::discover(), settings, QuotaRefresh::IfStale);
     let cached = cache.cached(settings.tools).unwrap();
     assert_eq!(snapshot.tools.len(), 1);
     let quota = &cached.tools[0];

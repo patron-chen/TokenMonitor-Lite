@@ -39,8 +39,8 @@
   const quotaSetup: Record<ToolId, { methods: string[]; instructions: string }> = $derived({
     codex: {
       methods: [local('Local logs', '本地日志'), 'OAuth'],
-      instructions: local('Quota windows come from local Codex logs. Sign in to Codex to enable Banked Reset.',
-        '周期额度来自本机 Codex 日志。登录本机 Codex 可读取 Banked Reset。')
+      instructions: local('Sign in to Codex to fetch live quota windows at startup and on manual refresh, and to read Banked Reset. Automatic updates use local logs for quota windows.',
+        '登录 Codex 后，Lite 在启动和手动刷新时联网读取周期额度，也可查询 Banked Reset。日常自动更新从本机日志读取周期额度。')
     },
     antigravity: {
       methods: ['RPC'],
