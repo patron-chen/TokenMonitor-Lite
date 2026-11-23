@@ -92,8 +92,8 @@ Codex 和 DeepSeek 的外网额度请求分别等待最多约 20 秒，并为 Po
 同步 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的应用版本并提交。推送与版本匹配的 `v` 标签后，Actions 会在 Windows x64 上执行检查和打包，将 `Token-Monitor-Lite-<版本>-win-x64.zip` 和含版本号、ZIP SHA-256 的 `update.json` 上传到对应的 GitHub Release。
 
 ```powershell
-git tag -a v0.1.18 -m "Token Monitor Lite 0.1.18"
-git push origin v0.1.18
+git tag -a v0.1.19 -m "Token Monitor Lite 0.1.19"
+git push origin v0.1.19
 ```
 
 重新运行可补传缺少的资产。更新清单以该 Release 上的 ZIP 为准。带预发行后缀的版本发布为 Pre-release，Lite 的更新只跟随稳定版。发布后可通过项目 Releases 的 `latest/download/update.json` 匿名读取清单，并核对其中的 SHA-256 与公开 ZIP 一致。
