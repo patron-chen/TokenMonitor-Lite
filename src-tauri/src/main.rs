@@ -17,6 +17,7 @@ mod quota_popup;
 mod session_metadata;
 mod settings;
 mod sources;
+mod updates;
 
 use std::{fs, path::PathBuf, sync::{Arc, Mutex}, time::Instant};
 
@@ -269,6 +270,10 @@ fn set_preferences(
             let _ = tray.set_tooltip(Some(tooltip(&summary, chinese)));
         }
     }
+    if !previous.auto_update && preferences.auto_update
+    {
+        updates::check_automatically(&app);
+    }
     Ok(())
 }
 
@@ -480,7 +485,9 @@ fn main()
         .invoke_handler(tauri::generate_handler![
             details_ready, dismiss_window, get_view_state, remember_view, set_appearance, set_preferences, get_collection_status,
             get_summary, get_activity, get_quotas, record_banked_reset_panel, get_quota_history, reset_quota_forecast,
-            quota_popup::set_quota_popup, quota_popup::report_quota_popup, list_sessions, get_session_detail, refresh
+            quota_popup::set_quota_popup, quota_popup::report_quota_popup, list_sessions, get_session_detail, refresh,
+            updates::update_status, updates::check_updates, updates::download_update, updates::install_update,
+            updates::open_update_releases
         ])
         .on_window_event(|window, event| {
             if window.label() == quota_popup::WINDOW
@@ -543,6 +550,7 @@ fn main()
             app.manage(log.clone());
             let preferences = Arc::new(PreferencesStore::load(&root));
             app.manage(preferences.clone());
+            app.manage(updates::Updates::new(app.handle(), &root));
             let chinese = preferences.get().language.resolve() == Language::Chinese;
             let handle = app.handle().clone();
             let quotas = Arc::new(QuotaCache::new(&root, log.clone()));
@@ -636,6 +644,7 @@ fn main()
             let saved = fs::read(app_data_root().join("appearance.json")).unwrap_or_default();
             *app.state::<WindowMemory>().appearance.lock().expect("appearance") = decode_appearance(&saved);
             log.write(format_args!("startup result=ready"));
+            updates::start(app.handle().clone());
             if std::env::args_os().any(|arg| arg == "--open")
             {
                 open(app.handle(), None);

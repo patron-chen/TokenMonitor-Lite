@@ -82,20 +82,47 @@ jobs:
           if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) { throw "Missing archive $zip." }
 
           $release = gh release view $tag --json isDraft,assets 2>$null
-          if ($LASTEXITCODE -ne 0)
+          $state = if ($LASTEXITCODE -eq 0) { $release | ConvertFrom-Json }
+          $assets = @($state.assets.name)
+          $name = Split-Path -Leaf $zip
+          $archiveToHash = $zip
+          if ($name -cin $assets)
+          {
+            # The retry may build different ZIP bytes. Bind the manifest to the published asset.
+            $archiveToHash = Join-Path $env:RUNNER_TEMP $name
+            gh release download $tag --pattern $name --output $archiveToHash --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $manifest = Join-Path (Split-Path -Parent $zip) 'update.json'
+          $sha256 = (Get-FileHash -LiteralPath $archiveToHash -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{ version = $env:RELEASE_VERSION; sha256 = $sha256 } | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath $manifest -Encoding utf8NoBOM -NoNewline
+
+          if (!$state)
           {
             $options = @('--verify-tag', '--generate-notes', '--title', "Token Monitor Lite $tag")
             if ($env:RELEASE_VERSION -match '^[^-+]+-') { $options += '--prerelease' }
-            gh release create $tag $zip @options
+            gh release create $tag $zip $manifest @options
             exit $LASTEXITCODE
           }
 
-          # A retry can complete a draft or add its missing ZIP.
-          $state = $release | ConvertFrom-Json
-          $name = Split-Path -Leaf $zip
-          if ($name -cnotin @($state.assets.name))
+          $missing = @()
+          if ($name -cnotin $assets) { $missing += $zip }
+          if ('update.json' -cin $assets)
           {
-            gh release upload $tag $zip
+            $existing = gh release download $tag --pattern update.json --output -
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $metadata = $existing | ConvertFrom-Json
+            if ($metadata.version -cne $env:RELEASE_VERSION -or $metadata.sha256 -ne $sha256)
+            {
+              throw 'The uploaded update.json does not match the release ZIP.'
+            }
+          }
+          else { $missing += $manifest }
+
+          if ($missing.Count -gt 0)
+          {
+            gh release upload $tag @missing
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           if ($state.isDraft)

@@ -4050,6 +4050,7 @@ dependencies = [
  "iana-time-zone",
  "notify",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

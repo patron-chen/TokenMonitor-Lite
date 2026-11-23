@@ -14,7 +14,7 @@ export type Cadence = 'live' | '5m' | '15m' | '30m';
 export type QuotaRefresh = 'ifStale' | 'panel' | 'manual';
 export type UiLanguage = 'en' | 'zh-CN';
 export type Language = 'system' | UiLanguage;
-export type SettingsSection = 'appearance' | 'collection' | 'quotas';
+export type SettingsSection = 'appearance' | 'collection' | 'quotas' | 'about';
 
 export interface Preferences
 {
@@ -22,6 +22,19 @@ export interface Preferences
   statisticsRange: StatisticsRange;
   collection: { cadence: Cadence; tools: ToolSelection };
   quotas: { refreshMinutes: number; tools: ToolSelection };
+  autoUpdate: boolean;
+}
+
+export interface UpdateStatus
+{
+  version: string;
+  availableVersion: string | null;
+  checkedAt: number | null;
+  phase: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'installing';
+  failure: 'network' | 'missingManifest' | 'invalidManifest' | 'download' | 'invalidArchive' | 'storage'
+    | 'installDirectory' | 'installFailed' | null;
+  lastInstall: 'updated' | 'installFailed' | 'rollbackFailed' | null;
+  canInstall: boolean;
 }
 
 export interface CollectionStatus
@@ -38,7 +51,8 @@ export const defaultPreferences: Preferences = {
   language: 'system',
   statisticsRange: 'last30',
   collection: { cadence: 'live', tools: { codex: true, antigravity: true, dsh: true } },
-  quotas: { refreshMinutes: 2, tools: { codex: true, antigravity: true, dsh: true } }
+  quotas: { refreshMinutes: 2, tools: { codex: true, antigravity: true, dsh: true } },
+  autoUpdate: true
 };
 
 export interface Counts
@@ -245,6 +259,13 @@ export const backend = {
   appearance: (appearance: Appearance) => invoke<void>('set_appearance', { appearance }),
   preferences: (preferences: Preferences, period: Period) => invoke<void>('set_preferences', { preferences, period }),
   collection: () => invoke<CollectionStatus>('get_collection_status'),
+  updateStatus: () => invoke<UpdateStatus>('update_status'),
+  checkUpdates: () => invoke<void>('check_updates'),
+  downloadUpdate: () => invoke<void>('download_update'),
+  installUpdate: () => invoke<void>('install_update'),
+  openUpdateReleases: () => invoke<void>('open_update_releases'),
+  updateStatusChanged: (callback: (status: UpdateStatus) => void) =>
+    listen<UpdateStatus>('update-status-changed', event => callback(event.payload)),
   dismiss: () => invoke<void>('dismiss_window'),
   summary: (period: Period) => invoke<Summary>('get_summary', { period }),
   activity: (force: boolean) => invoke<Activity>('get_activity', { force }),

@@ -45,7 +45,7 @@ Antigravity 按服务返回的模型组分别校准 5 小时与每周额度。Go
 
 每次托盘空闲检查都会并行查询已启用的额度，即使没有新日志或已关闭所有用量采集。在任一视图点右下角「刷新」，或从托盘菜单选「刷新」，也会立即发起同样的查询。Codex 联网读取 5 小时、每周额度和 Banked Reset，Antigravity 向运行中的本机服务请求最新额度，DeepSeek 使用已配置的密钥查询余额。某项查询失败时，保留该项最近的可用读数。
 
-Codex 在线额度、Banked Reset、DeepSeek 余额、Antigravity 本机 RPC 和构建时的 Tokscale 下载共用 HTTP 请求接口。回环地址和 `NO_PROXY` 匹配的域名或 IP 直连（逗号分隔，`*` 匹配全部）。其余请求优先使用 Lite 的 `--proxy-server` 启动参数，然后按目标协议读取 `HTTP_PROXY` 或 `HTTPS_PROXY`，其次使用 `ALL_PROXY`。构建时下载使用构建进程的代理环境。
+Codex 在线额度、Banked Reset、DeepSeek 余额、Antigravity 本机 RPC、Lite 更新和构建时的 Tokscale 下载共用 HTTP 请求接口。回环地址和 `NO_PROXY` 匹配的域名或 IP 直连（逗号分隔，`*` 匹配全部）。其余请求优先使用 Lite 的 `--proxy-server` 启动参数，然后按目标协议读取 `HTTP_PROXY` 或 `HTTPS_PROXY`，其次使用 `ALL_PROXY`。构建时下载使用构建进程的代理环境。
 
 Windows 快捷方式的「目标」可参照下例填写，将路径换成实际安装位置。更改参数后，从托盘退出 Lite，再用该快捷方式启动。
 
@@ -72,6 +72,9 @@ Codex 和 DeepSeek 的外网额度请求分别等待最多约 20 秒，并为 Po
 - **外观**选择跟随系统、简体中文或 English。语言设置保存在本机，切换后立即应用到详情窗口和托盘。也可调节背景不透明度（65%–100%）和标准、较大、最大三档字号。
 - **采集**选择追踪的工具和托盘空闲最长间隔。打开详情窗口或将鼠标移入托盘图标时立即刷新今日用量，窗口打开或鼠标停留期间，日志变化后约 3–5 秒开始采集。窗口收起且鼠标离开后，默认依次等待 1、3、5、10、20 分钟检查，之后每 20 分钟检查一次。期间的日志写入合并到下次检查，间隔继续递增。日志监看正常且没有变化时跳过用量扫描和用量库写入，仍查询已启用的额度，成功读数写入额度历史。再次打开、悬停或使用托盘菜单刷新会重置间隔。原来的实时设置对应默认 20 分钟上限，已选的 5、15、30 分钟对应各自的托盘上限。点工具名可查看日志目录和今日用量。切换追踪工具会从现存日志重新计算今日和当前周期的统计。
 - **AI 工具额度**独立选择读取哪些工具的额度和主页、额度页的刷新频率。点工具名查看接入方式。收起窗口且鼠标离开托盘后，额度查询跟随「托盘空闲最长间隔」。设置保存在本机。
+- **关于 Lite**显示当前版本、可用新版、最近检查时间和发布页。自动更新默认开启，便携版在启动后及运行期间每 24 小时检查一次。通过校验的新版会在后台准备好，点击「重启并更新」后才安装。关闭自动更新后可手动检查和下载。
+
+更新需要应用目录可写。Lite 在原目录替换应用、Tokscale 和随包文件，然后重新启动，沿用原有设置和用量数据。首次使用带更新功能的版本时，请从发布页下载并解压完整 ZIP。
 
 ## 构建
 
@@ -83,14 +86,14 @@ Codex 和 DeepSeek 的外网额度请求分别等待最多约 20 秒，并为 Po
 
 ### GitHub 发布
 
-同步 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的应用版本并提交。推送与版本匹配的 `v` 标签后，Actions 会在 Windows x64 上执行检查和打包，将 `Token-Monitor-Lite-<版本>-win-x64.zip` 上传到对应的 GitHub Release。
+同步 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的应用版本并提交。推送与版本匹配的 `v` 标签后，Actions 会在 Windows x64 上执行检查和打包，将 `Token-Monitor-Lite-<版本>-win-x64.zip` 和含版本号、ZIP SHA-256 的 `update.json` 上传到对应的 GitHub Release。
 
 ```powershell
 git tag -a v0.1.17 -m "Token Monitor Lite 0.1.17"
 git push origin v0.1.17
 ```
 
-重新运行可补传缺少的 ZIP，并复用已有同名资产。带预发行后缀的版本发布为 Pre-release。
+重新运行可补传缺少的资产。更新清单以该 Release 上的 ZIP 为准。带预发行后缀的版本发布为 Pre-release，Lite 的更新只跟随稳定版。发布后可通过项目 Releases 的 `latest/download/update.json` 匿名读取清单，并核对其中的 SHA-256 与公开 ZIP 一致。
 
 ### 开发与验证
 

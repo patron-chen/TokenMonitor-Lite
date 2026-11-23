@@ -3,6 +3,7 @@
   import type { Snippet } from 'svelte';
   import type { Appearance, Backdrop, Cadence, CollectionStatus, Language, Preferences, SettingsSection, StatisticsRange, ToolId } from './api';
   import { compact, icons, local, number, statisticsRangeLabels, time, toolInfo } from './display';
+  import AboutPanel from './AboutPanel.svelte';
 
   interface Props
   {
@@ -25,7 +26,8 @@
   const sections: { id: SettingsSection; name: string; icon: string }[] = $derived([
     { id: 'appearance', name: local('Appearance', '外观'), icon: icons.appearance },
     { id: 'collection', name: local('Collection', '采集'), icon: icons.collection },
-    { id: 'quotas', name: local('AI Tool Limits', 'AI 工具额度'), icon: icons.limits }
+    { id: 'quotas', name: local('AI Tool Limits', 'AI 工具额度'), icon: icons.limits },
+    { id: 'about', name: local('About Lite', '关于 Lite'), icon: icons.about }
   ]);
   const sizes: Record<number, string> = $derived({
     100: local('Standard', '标准'), 110: local('Larger', '较大'), 120: local('Largest', '最大')
@@ -63,6 +65,7 @@
   {
     if (id === 'appearance') return sizes[appearance.fontScale] + ' · ' + appearance.opacity + '%';
     if (id === 'collection') return local(`${tracked} tools · live`, `${tracked} 个工具 · 实时`);
+    if (id === 'about') return '';
     return local(`${enabledQuotas} enabled · ${quotaMinutes} min`, `启用 ${enabledQuotas} · ${quotaMinutes} 分钟`);
   }
 
@@ -135,7 +138,7 @@
             {tab.name}
           </span>
           <span class="settings-section-aside">
-            <span class="ellipsis">{summary(tab.id)}</span>
+            {#if tab.id !== 'about'}<span class="ellipsis">{summary(tab.id)}</span>{/if}
             <span class="chevron" aria-hidden="true"></span>
           </span>
         </button>
@@ -268,6 +271,9 @@
               </select>
               <p class="settings-note">{local('Applies to the Home and Limits views. In the tray, quotas follow the idle check interval.', '用于主页和额度页的刷新。托盘空闲时，额度按托盘检查间隔查询。')}</p>
             </div>
+          {:else if open && tab.id === 'about'}
+            <AboutPanel autoUpdate={preferences.autoUpdate} saving={busy.settings}
+              saveAutoUpdate={autoUpdate => setPreferences({ ...preferences, autoUpdate })} />
           {/if}
           {#if open && errors.settings}
             <p class="settings-note error" role="status">{local('Could not save settings.', '无法保存设置。')}</p>

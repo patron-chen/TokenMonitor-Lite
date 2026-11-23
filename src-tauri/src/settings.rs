@@ -137,7 +137,7 @@ impl Language
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences
 {
@@ -145,6 +145,18 @@ pub struct Preferences
     pub statistics_range: StatisticsRange,
     pub collection: CollectionSettings,
     pub quotas: QuotaSettings,
+    pub auto_update: bool,
+}
+
+impl Default for Preferences
+{
+    fn default() -> Self
+    {
+        Self {
+            language: Language::default(), statistics_range: StatisticsRange::default(),
+            collection: CollectionSettings::default(), quotas: QuotaSettings::default(), auto_update: true,
+        }
+    }
 }
 
 pub struct PreferencesStore
@@ -208,6 +220,16 @@ mod tests
         assert_eq!(settings.quotas.tools.enabled().collect::<Vec<_>>(), ["antigravity", "dsh"]);
         assert_eq!(settings.collection.tools.scope("today".into()), "today");
         assert_eq!(settings.quotas.tools.scope("today".into()), "today|tools:antigravity,dsh");
+    }
+
+    #[test]
+    fn automatic_updates_default_on_and_can_stay_disabled()
+    {
+        assert!(Preferences::default().auto_update);
+        assert!(serde_json::from_str::<Preferences>(r#"{"language":"en"}"#).unwrap().auto_update);
+        let disabled: Preferences = serde_json::from_str(r#"{"autoUpdate":false}"#).unwrap();
+        assert!(!disabled.auto_update);
+        assert_eq!(serde_json::to_value(disabled).unwrap()["autoUpdate"], false);
     }
 
     #[test]
