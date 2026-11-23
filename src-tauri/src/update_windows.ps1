@@ -72,6 +72,8 @@ function Start-LiteUpdatedApp([string]$Path)
     $start.UseShellExecute = $false
     $start.WorkingDirectory = [IO.Path]::GetDirectoryName($Path)
     # Lite already normalized --proxy-server into its inherited environment.
+    $start.EnvironmentVariables.Remove('TOKEN_MONITOR_LITE_APP_PROXY_URL')
+    $start.EnvironmentVariables.Remove('TOKEN_MONITOR_LITE_APP_NO_PROXY')
     foreach ($name in 'FILE','SHA256','EXE','PARENT','RESULT')
     {
         $start.EnvironmentVariables.Remove('LITE_UPDATE_' + $name)

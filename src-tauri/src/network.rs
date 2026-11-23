@@ -37,9 +37,15 @@ pub(crate) fn proxy_server(args: impl IntoIterator<Item = impl AsRef<str>>) -> O
 pub(crate) fn start_powershell(script: &str, vars: &[(&str, &OsStr)], input: Stdio, stderr: Stdio) -> Option<Child>
 {
     let powershell = PathBuf::from(std::env::var_os("SystemRoot")?).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    Command::new(powershell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .envs(vars.iter().copied()).stdin(input).stdout(Stdio::piped()).stderr(stderr)
+    let mut command = Command::new(powershell);
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]).envs(vars.iter().copied());
+    // Each worker uses the settings saved when it starts, including throughout redirects.
+    if let Some(proxy) = crate::proxy::current()
+    {
+        command.env("TOKEN_MONITOR_LITE_APP_PROXY_URL", proxy.proxy_url)
+            .env("TOKEN_MONITOR_LITE_APP_NO_PROXY", proxy.no_proxy);
+    }
+    command.stdin(input).stdout(Stdio::piped()).stderr(stderr)
         .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW).spawn().ok()
 }
 

@@ -1,8 +1,90 @@
-# Shared by the embedded quota reader and the build-time scanner download.
+# Shared by the quota reader, updater and build-time scanner download.
+function Test-LiteProxyNetwork([Net.IPAddress]$Address, [string]$Rule)
+{
+    if (!$Address) { return $false }
+    $networkText, $prefixText = $Rule -split '/', 2
+    $network = $null
+    $prefix = 0
+    if (![Net.IPAddress]::TryParse($networkText, [ref]$network) -or ![int]::TryParse($prefixText, [ref]$prefix) -or
+        $Address.AddressFamily -ne $network.AddressFamily)
+    {
+        return $false
+    }
+
+    $actual = $Address.GetAddressBytes()
+    $expected = $network.GetAddressBytes()
+    if ($prefix -lt 0 -or $prefix -gt $actual.Length * 8) { return $false }
+    # Compare the high bits of the last byte when the prefix falls between byte boundaries.
+    for ($i = 0; $prefix -gt 0; $i++)
+    {
+        $shift = 8 - [Math]::Min($prefix, 8)
+        if (($actual[$i] -shr $shift) -ne ($expected[$i] -shr $shift)) { return $false }
+        $prefix -= 8
+    }
+    return $true
+}
+
+function Test-LiteAppProxyBypass([uri]$Uri, [string]$Rules)
+{
+    $hostName = $Uri.IdnHost.TrimEnd('.').Trim('[', ']')
+    if ($hostName -in 'localhost','loopback' -or $hostName.EndsWith('.localhost', [StringComparison]::OrdinalIgnoreCase))
+    {
+        return $true
+    }
+
+    # Match local literals without DNS, as the original app does.
+    $address = $null
+    if ([Net.IPAddress]::TryParse($hostName, [ref]$address))
+    {
+        $local = if ($address.IsIPv4MappedToIPv6) { $address.MapToIPv4() } else { $address }
+        $octets = $local.GetAddressBytes()
+        if ([Net.IPAddress]::IsLoopback($local) -or $local.IsIPv6LinkLocal -or
+            ($octets.Length -eq 4 -and $octets[0] -eq 169 -and $octets[1] -eq 254))
+        {
+            return $true
+        }
+    }
+
+    foreach ($rule in $Rules -split ',')
+    {
+        if ($rule -eq '*') { return $true }
+        if ($rule.Contains('/'))
+        {
+            if (Test-LiteProxyNetwork $address $rule) { return $true }
+            continue
+        }
+        if ($rule -notmatch '^(?<host>\[[^\]]+\]|[^:]+)(?::(?<port>[0-9]+))?$') { continue }
+        if ($Matches.port -and [int]$Matches.port -ne $Uri.Port) { continue }
+        $name = $Matches.host.Trim('[', ']')
+        $entry = $null
+        if ([Net.IPAddress]::TryParse($name, [ref]$entry))
+        {
+            if ($address -and $address.Equals($entry)) { return $true }
+        }
+        elseif (!$address -and ($hostName -eq $name -or $hostName.EndsWith('.' + $name, [StringComparison]::OrdinalIgnoreCase)))
+        {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Get-LiteProxy([uri]$Uri, [hashtable]$Decision = @{})
 {
     $Decision.Source = 'loopback'
     if ($Uri.IsLoopback) { return 'DIRECT' }
+    $appProxy = $env:TOKEN_MONITOR_LITE_APP_PROXY_URL
+    if ($appProxy)
+    {
+        if (Test-LiteAppProxyBypass $Uri $env:TOKEN_MONITOR_LITE_APP_NO_PROXY)
+        {
+            $Decision.Source = 'app_bypass'
+            return 'DIRECT'
+        }
+        $Decision.Source = 'app_settings'
+        return $appProxy
+    }
+
     $Decision.Source = 'NO_PROXY'
     $hostName = $Uri.DnsSafeHost.TrimEnd('.')
     foreach ($entry in ([string]$env:NO_PROXY -split ','))

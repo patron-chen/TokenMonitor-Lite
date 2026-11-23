@@ -502,6 +502,19 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .settings-item select { cursor: pointer; }
 .settings-action:hover:not(:disabled) { background: #35424d; }
 .settings-update-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
+.settings-proxy-field > :is(label, input) { grid-column: 1 / -1; }
+.settings-proxy-field input
+{
+  min-width: 0;
+  min-height: 28px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #262e35;
+  color: var(--text);
+  font: .625rem/1.2 var(--mono);
+}
+.settings-proxy-save > button { grid-column: 2; }
 .settings-range { grid-column: 1 / -1; width: 100%; margin: 3px 0 0; accent-color: var(--accent); cursor: pointer; }
 .settings-note { grid-column: 1 / -1; color: var(--muted); font-size: .625rem; }
 .settings-note { margin: 0; }

@@ -13,6 +13,7 @@ import refresh from './icons/actions/refresh.svg?url';
 import settings from './icons/actions/settings.svg?url';
 import appearance from './icons/settings/appearance.svg?url';
 import collection from './icons/settings/collection.svg?url';
+import network from './icons/settings/network.svg?url';
 import about from './icons/settings/about.svg?url';
 import search from './icons/actions/search.svg?url';
 import back from './icons/actions/arrow-left.svg?url';
@@ -28,7 +29,7 @@ export const statisticsRangeLabels = (): Record<StatisticsRange, string> => ({
   last7: local(statisticsRangeTabLabels.last7, '7 天'),
   last30: local(statisticsRangeTabLabels.last30, '30 天')
 });
-export const icons = { home, tools, models, sessions, limits, trends, refresh, settings, appearance, collection, about, search, back, spinner };
+export const icons = { home, tools, models, sessions, limits, trends, refresh, settings, appearance, collection, network, about, search, back, spinner };
 export const views: View[] = ['home', 'limits', 'tools', 'models', 'sessions'];
 const viewLabels: Record<View, [string, string]> = {
   home: ['Home', '主页'],

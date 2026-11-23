@@ -11,6 +11,7 @@ mod network;
 mod placement;
 mod popover;
 mod pricing;
+mod proxy;
 mod quota;
 mod quota_history;
 mod quota_popup;
@@ -487,7 +488,7 @@ fn main()
             get_summary, get_activity, get_quotas, record_banked_reset_panel, get_quota_history, reset_quota_forecast,
             quota_popup::set_quota_popup, quota_popup::report_quota_popup, list_sessions, get_session_detail, refresh,
             updates::update_status, updates::check_updates, updates::download_update, updates::install_update,
-            updates::open_update_releases
+            updates::open_update_releases, proxy::get_proxy_settings, proxy::set_proxy_settings
         ])
         .on_window_event(|window, event| {
             if window.label() == quota_popup::WINDOW
@@ -546,6 +547,7 @@ fn main()
         .setup(|app| {
             let root = app_data_root();
             fs::create_dir_all(&root)?;
+            proxy::initialize(&root);
             let log = Arc::new(AppLog::new(&root));
             app.manage(log.clone());
             let preferences = Arc::new(PreferencesStore::load(&root));

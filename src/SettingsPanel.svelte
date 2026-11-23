@@ -4,6 +4,7 @@
   import type { Appearance, Backdrop, Cadence, CollectionStatus, Language, Preferences, SettingsSection, StatisticsRange, ToolId } from './api';
   import { compact, icons, local, number, statisticsRangeLabels, time, toolInfo } from './display';
   import AboutPanel from './AboutPanel.svelte';
+  import ProxyPanel from './ProxyPanel.svelte';
 
   interface Props
   {
@@ -27,6 +28,7 @@
     { id: 'appearance', name: local('Appearance', '外观'), icon: icons.appearance },
     { id: 'collection', name: local('Collection', '采集'), icon: icons.collection },
     { id: 'quotas', name: local('AI Tool Limits', 'AI 工具额度'), icon: icons.limits },
+    { id: 'network', name: local('Network proxy', '网络代理'), icon: icons.network },
     { id: 'about', name: local('About Lite', '关于 Lite'), icon: icons.about }
   ]);
   const sizes: Record<number, string> = $derived({
@@ -65,8 +67,8 @@
   {
     if (id === 'appearance') return sizes[appearance.fontScale] + ' · ' + appearance.opacity + '%';
     if (id === 'collection') return local(`${tracked} tools · live`, `${tracked} 个工具 · 实时`);
-    if (id === 'about') return '';
-    return local(`${enabledQuotas} enabled · ${quotaMinutes} min`, `启用 ${enabledQuotas} · ${quotaMinutes} 分钟`);
+    if (id === 'quotas') return local(`${enabledQuotas} enabled · ${quotaMinutes} min`, `启用 ${enabledQuotas} · ${quotaMinutes} 分钟`);
+    return '';
   }
 
   function switchTool(area: 'collection' | 'quotas', tool: ToolId, enabled: boolean)
@@ -126,6 +128,7 @@
   <div class="settings-stack">
     {#each sections as tab (tab.id)}
       {@const open = section === tab.id}
+      {@const aside = summary(tab.id)}
       <section class="settings-section" class:expanded={open}>
         <button class="settings-section-toggle" type="button" id={'settings-' + tab.id + '-label'}
           aria-expanded={open} aria-controls={'settings-' + tab.id}
@@ -138,7 +141,7 @@
             {tab.name}
           </span>
           <span class="settings-section-aside">
-            {#if tab.id !== 'about'}<span class="ellipsis">{summary(tab.id)}</span>{/if}
+            {#if aside}<span class="ellipsis">{aside}</span>{/if}
             <span class="chevron" aria-hidden="true"></span>
           </span>
         </button>
@@ -271,6 +274,8 @@
               </select>
               <p class="settings-note">{local('Applies to the Home and Limits views. In the tray, quotas follow the idle check interval.', '用于主页和额度页的刷新。托盘空闲时，额度按托盘检查间隔查询。')}</p>
             </div>
+          {:else if open && tab.id === 'network'}
+            <ProxyPanel />
           {:else if open && tab.id === 'about'}
             <AboutPanel autoUpdate={preferences.autoUpdate} saving={busy.settings}
               saveAutoUpdate={autoUpdate => setPreferences({ ...preferences, autoUpdate })} />

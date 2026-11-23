@@ -14,7 +14,7 @@ export type Cadence = 'live' | '5m' | '15m' | '30m';
 export type QuotaRefresh = 'ifStale' | 'panel' | 'manual';
 export type UiLanguage = 'en' | 'zh-CN';
 export type Language = 'system' | UiLanguage;
-export type SettingsSection = 'appearance' | 'collection' | 'quotas' | 'about';
+export type SettingsSection = 'appearance' | 'collection' | 'quotas' | 'network' | 'about';
 
 export interface Preferences
 {
@@ -23,6 +23,17 @@ export interface Preferences
   collection: { cadence: Cadence; tools: ToolSelection };
   quotas: { refreshMinutes: number; tools: ToolSelection };
   autoUpdate: boolean;
+}
+
+export interface ProxySettings
+{
+  proxyUrl: string;
+  noProxy: string;
+}
+
+export interface ProxyStatus extends ProxySettings
+{
+  source: 'custom' | 'launchArgument' | 'environment' | 'windows';
 }
 
 export interface UpdateStatus
@@ -259,6 +270,8 @@ export const backend = {
   appearance: (appearance: Appearance) => invoke<void>('set_appearance', { appearance }),
   preferences: (preferences: Preferences, period: Period) => invoke<void>('set_preferences', { preferences, period }),
   collection: () => invoke<CollectionStatus>('get_collection_status'),
+  proxySettings: () => invoke<ProxyStatus>('get_proxy_settings'),
+  saveProxySettings: (settings: ProxySettings) => invoke<ProxyStatus>('set_proxy_settings', { settings }),
   updateStatus: () => invoke<UpdateStatus>('update_status'),
   checkUpdates: () => invoke<void>('check_updates'),
   downloadUpdate: () => invoke<void>('download_update'),

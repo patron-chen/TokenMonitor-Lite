@@ -169,6 +169,72 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
 }
 
 #[test]
+fn app_proxy_overrides_inherited_routes_and_preserves_local_bypass()
+{
+    let script = concat!(include_str!("../../../scripts/windows-http.ps1"), r#"
+$routes = @{}
+$targets = @{
+    release = 'https://github.com/patron-chen/TokenMonitor-Lite/releases/latest/download/update.json'
+    archive = 'https://release-assets.githubusercontent.com/example'
+    quota = 'https://chatgpt.com/backend-api/wham/usage'
+    domain = 'https://sub.example.com'
+    otherPort = 'https://example.com:8443'
+    unrelated = 'https://notexample.com'
+    ip = 'http://192.0.2.10:8443'
+    ipv6 = 'https://[2001:0db8::1]'
+    cidrFirst = 'http://10.0.0.0'
+    cidrLast = 'https://10.255.255.255:8443'
+    cidrBefore = 'http://9.255.255.255'
+    cidrAfter = 'http://11.0.0.0'
+    cidrPartial = 'http://172.31.255.255'
+    cidrPartialOutside = 'http://172.32.0.0'
+    cidrIpv6 = 'https://[2001:db8:ffff::1]'
+    cidrIpv6Outside = 'https://[2001:db8:7fff::1]'
+    cidrDomain = 'http://10.0.0.1.example.net'
+    local = 'http://127.0.0.1:9922'
+    alias = 'http://sub.localhost'
+    linkLocal = 'http://169.254.1.1'
+}
+foreach ($target in $targets.GetEnumerator())
+{
+    $decision = @{}
+    $route = Get-LiteProxy $target.Value $decision
+    $routes[$target.Key] = @{ proxy = $route; source = $decision.Source }
+}
+$env:TOKEN_MONITOR_LITE_APP_PROXY_URL = ''
+$startup = Get-LiteProxy $targets.quota
+$env:TOKEN_MONITOR_LITE_PROXY_SERVER = ''
+$fallback = Get-LiteProxy $targets.archive
+$inheritedBypass = Get-LiteProxy $targets.release
+ConvertTo-Json -Depth 4 -InputObject @{ routes = $routes; startup = $startup; fallback = $fallback; inheritedBypass = $inheritedBypass }
+"#);
+    let custom = "http://127.0.0.1:7890";
+    let startup = "http://startup.invalid:1234";
+    let environment = "http://environment.invalid:1234";
+    let result: Value = powershell_json(script, &[
+        ("TOKEN_MONITOR_LITE_APP_PROXY_URL", custom.as_ref()),
+        ("TOKEN_MONITOR_LITE_APP_NO_PROXY",
+            "example.com:443,192.0.2.10:8443,[2001:db8::1]:443,10.0.0.0/8,172.16.0.0/12,2001:db8:8000::/33".as_ref()),
+        (crate::network::PROXY_SERVER_ENV, startup.as_ref()),
+        ("HTTPS_PROXY", environment.as_ref()),
+        ("NO_PROXY", "github.com".as_ref()),
+    ], Duration::from_secs(8), &AppLog::default()).unwrap();
+
+    for key in ["release", "archive", "quota", "otherPort", "unrelated", "cidrBefore", "cidrAfter",
+        "cidrPartialOutside", "cidrIpv6Outside", "cidrDomain"]
+    {
+        assert_eq!(result["routes"][key], json!({ "proxy": custom, "source": "app_settings" }));
+    }
+    for key in ["domain", "ip", "ipv6", "local", "alias", "linkLocal", "cidrFirst", "cidrLast", "cidrPartial", "cidrIpv6"]
+    {
+        assert_eq!(result["routes"][key]["proxy"], "DIRECT");
+    }
+    assert_eq!(result["startup"], startup);
+    assert_eq!(result["fallback"], environment);
+    assert_eq!(result["inheritedBypass"], "DIRECT");
+}
+
+#[test]
 fn winhttp_ends_a_slow_exchange_even_when_body_bytes_keep_arriving()
 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
