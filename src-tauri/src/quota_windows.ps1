@@ -1,5 +1,4 @@
 $ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 function Write-QuotaTrace([string]$Source, [string]$Message)
 {
@@ -11,8 +10,9 @@ function Write-QuotaTrace([string]$Source, [string]$Message)
     catch {} # Diagnostics are best effort and must never enter the helper's JSON output.
 }
 
-function Write-BankedResetTrace([string]$Message) { Write-QuotaTrace 'banked_reset' $Message }
+function Write-CodexQuotaTrace([string]$Message) { Write-QuotaTrace "codex_quota trigger=$env:TOKEN_MONITOR_LITE_QUOTA_TRIGGER" $Message }
 function Write-CodexUsageTrace([string]$Message) { Write-QuotaTrace "codex_usage trigger=$env:TOKEN_MONITOR_LITE_QUOTA_TRIGGER" $Message }
+function Write-BankedResetTrace([string]$Message) { Write-QuotaTrace "banked_reset trigger=$env:TOKEN_MONITOR_LITE_QUOTA_TRIGGER" $Message }
 
 function Get-QuotaResponse([uri]$Uri, $Headers, [scriptblock]$Trace)
 {
@@ -47,8 +47,9 @@ function Get-QuotaResponse([uri]$Uri, $Headers, [scriptblock]$Trace)
     return $null
 }
 
-function Get-CodexHeaders([scriptblock]$Trace)
+function Get-CodexHeaders
 {
+    $trace = ${function:Write-CodexQuotaTrace}
     $stage = 'auth_read'
     try
     {
@@ -88,25 +89,23 @@ function Get-CodexHeaders([scriptblock]$Trace)
     return $null
 }
 
-function Get-CodexUsage
+function Get-CodexUsage($Headers)
 {
     $trace = ${function:Write-CodexUsageTrace}
-    $headers = Get-CodexHeaders $trace
-    if ($null -eq $headers) { return @{ error = 'auth_unavailable' } }
-    $usage = Get-QuotaResponse 'https://chatgpt.com/backend-api/wham/usage' $headers $trace
+    $usage = Get-QuotaResponse 'https://chatgpt.com/backend-api/wham/usage' $Headers $trace
     if ($null -eq $usage) { return @{ error = 'no_usage_response' } }
-    $account = if ($usage.account_id) { $usage.account_id } else { $headers['ChatGPT-Account-Id'] }
-    return @{ rate_limit = $usage.rate_limit; plan_type = $usage.plan_type; account_id = $account }
+    $account = if ($usage.account_id) { $usage.account_id } else { $Headers['ChatGPT-Account-Id'] }
+    # The numeric reading keeps its own timestamp while Banked Reset may still be in flight.
+    return @{ rate_limit = $usage.rate_limit; plan_type = $usage.plan_type; account_id = $account
+        observed_at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 }
 
-function Get-CodexBankedReset
+function Get-CodexBankedReset($Headers)
 {
-    $headers = Get-CodexHeaders ${function:Write-BankedResetTrace}
-    if ($null -eq $headers) { return $null }
     try
     {
         # This reads the signed-in account's reset inventory from the first-party host.
-        $result = Get-QuotaResponse 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits' $headers ${function:Write-BankedResetTrace}
+        $result = Get-QuotaResponse 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits' $Headers ${function:Write-BankedResetTrace}
         if ($null -ne $result)
         {
             $available = if ($null -ne $result.available_count) { $result.available_count } else { $result.availableCount }
@@ -132,13 +131,35 @@ function Get-CodexBankedReset
     return $null
 }
 
-$tools = $env:TOKEN_MONITOR_LITE_QUOTA_TOOLS -split ','
-$codexUsage = if ($tools -contains 'codex_usage') { Get-CodexUsage }
-$codexReset = if ($tools -contains 'codex') { Get-CodexBankedReset }
-$deepseek = if ($tools -contains 'dsh')
+function Get-CodexQuota
 {
-    $deepseekKey = $env:DEEPSEEK_API_KEY
-    if (!$deepseekKey) { $deepseekKey = $env:DEEPSEEK_KEY }
-    if ($deepseekKey) { Get-QuotaResponse 'https://api.deepseek.com/user/balance' @{ Authorization = "Bearer $($deepseekKey.Trim())" } }
+    $headers = Get-CodexHeaders
+    if ($null -eq $headers) { return @{ usage = @{ error = 'auth_unavailable' }; reset = $null } }
+
+    # Run both HTTP requests in one helper with the same account and independent timeouts.
+    $worker = [PowerShell]::Create()
+    try
+    {
+        [void]$worker.AddScript($quotaFunctions.ToString(), $false).AddStatement().AddCommand('Get-CodexUsage').AddArgument($headers)
+        $pending = $worker.BeginInvoke()
+        $reset = Get-CodexBankedReset $headers
+        try { $usage = $worker.EndInvoke($pending)[0] }
+        catch { $usage = @{ error = 'usage_worker_failed' } }
+        return @{ usage = $usage; reset = $reset }
+    }
+    finally { $worker.Dispose() }
 }
-ConvertTo-Json -Compress -Depth 20 -InputObject @{ codex_usage = $codexUsage; codex_reset = $codexReset; deepseek = $deepseek }
+
+function Read-LiteQuotas
+{
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $tools = $env:TOKEN_MONITOR_LITE_QUOTA_TOOLS -split ','
+    $codex = if ($tools -contains 'codex') { Get-CodexQuota }
+    $deepseek = if ($tools -contains 'dsh')
+    {
+        $deepseekKey = $env:DEEPSEEK_API_KEY
+        if (!$deepseekKey) { $deepseekKey = $env:DEEPSEEK_KEY }
+        if ($deepseekKey) { Get-QuotaResponse 'https://api.deepseek.com/user/balance' @{ Authorization = "Bearer $($deepseekKey.Trim())" } }
+    }
+    ConvertTo-Json -Compress -Depth 20 -InputObject @{ codex = $codex; deepseek = $deepseek }
+}

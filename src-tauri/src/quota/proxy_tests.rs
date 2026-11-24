@@ -3,7 +3,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{json, Value};
@@ -12,7 +12,7 @@ use crate::app_log::{AppLog, LOG_FILE};
 use super::{parse_online_codex, powershell_json, QUOTA_SCRIPT, REMOTE_HELPER_TIMEOUT};
 
 #[test]
-fn manual_and_idle_checks_query_codex_even_with_a_fresh_panel_cache()
+fn panel_reopens_share_the_startup_cache_and_due_checks_query_codex_once()
 {
     use super::{QuotaCache, QuotaRefresh};
     use crate::{settings::{QuotaSettings, ToolSelection}, sources::Sources};
@@ -24,7 +24,11 @@ fn manual_and_idle_checks_query_codex_even_with_a_fresh_panel_cache()
     // Keep all source paths in the fixture. Missing auth stops each real helper before HTTP.
     let mut sources = Sources::from_home(Some(root.clone()));
     sources.home_override = None;
-    cache.read(&sources, settings, QuotaRefresh::Panel);
+    cache.read(&sources, settings, QuotaRefresh::Startup);
+    for _ in 0..3 { cache.read(&sources, settings, QuotaRefresh::IfStale); }
+    // Exercise the scheduled panel refresh after the cache expires.
+    let panel_interval = Duration::from_secs(u64::from(settings.refresh_minutes) * 60);
+    *cache.refreshed.lock().unwrap() = Some((Instant::now() - panel_interval, tools));
     cache.read(&sources, settings, QuotaRefresh::IfStale);
     cache.read(&sources, settings, QuotaRefresh::TrayIdle);
     cache.read(&sources, settings, QuotaRefresh::TrayIdle);
@@ -35,14 +39,16 @@ fn manual_and_idle_checks_query_codex_even_with_a_fresh_panel_cache()
 
     let log = root.join("logs").join(LOG_FILE);
     let trace = fs::read_to_string(&log).unwrap();
-    assert_eq!(trace.matches("codex_usage trigger=manual auth result=file_missing").count(), 1);
-    assert_eq!(trace.matches("codex_usage trigger=tray_idle auth result=file_missing").count(), 2);
-    assert_eq!(trace.matches("banked_reset auth result=file_missing").count(), 4);
-    assert!(!trace.contains("codex_usage trigger=panel"));
-    assert!(!trace.contains("quota scan trigger=tray_idle"));
     fs::remove_file(log).unwrap();
     fs::remove_dir(root.join("logs")).unwrap();
     fs::remove_dir(root).unwrap();
+
+    assert_eq!(trace.matches("codex_quota trigger=startup auth result=file_missing").count(), 1);
+    assert_eq!(trace.matches("codex_quota trigger=panel auth result=file_missing").count(), 1);
+    assert_eq!(trace.matches("codex_quota trigger=manual auth result=file_missing").count(), 1);
+    assert_eq!(trace.matches("codex_quota trigger=tray_idle auth result=file_missing").count(), 2);
+    assert_eq!(trace.matches("refresh result=cache_hit").count(), 3);
+    assert!(!trace.contains("quota scan trigger=tray_idle"));
 }
 
 #[test]
@@ -54,7 +60,8 @@ fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
     let origin = format!("{proxy}/direct");
     let server = thread::spawn(move || {
         let mut requests = Vec::new();
-        let mut delayed = false;
+        let mut waiting_codex = Vec::new();
+        let mut codex_done = false;
         for client in listener.incoming()
         {
             let mut client = client.unwrap();
@@ -64,12 +71,6 @@ fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
             let headers: Vec<_> = headers.take_while(|line| !line.is_empty()).collect();
             let target = first.split_whitespace().nth(1).unwrap();
             let authorized = |value: &str| headers.iter().any(|h| h.eq_ignore_ascii_case(value));
-            // The old shared helper was killed at 13s, even with a legitimate response in flight.
-            if target == "http://quota.invalid/resets" && !delayed
-            {
-                delayed = true;
-                thread::sleep(Duration::from_secs(14));
-            }
             let body = match target
             {
                 "http://quota.invalid/usage" if authorized("Authorization: Bearer codex-fixture")
@@ -84,7 +85,23 @@ fn slow_remote_quota_uses_shortcut_then_environment_and_respects_bypass()
             }.to_string();
             // Observe HTTPS proxy selection without opening a real upstream connection.
             let status = if first.starts_with("CONNECT ") { "403 Forbidden" } else { "200 OK" };
-            write!(client, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            if !codex_done && matches!(target, "http://quota.invalid/usage" | "http://quota.invalid/resets")
+            {
+                // Withhold both replies until both requests have started, then delay Banked Reset past 13s.
+                waiting_codex.push((target.ends_with("/resets"), client, response));
+                if waiting_codex.len() == 2
+                {
+                    waiting_codex.sort_by_key(|(is_reset, ..)| *is_reset);
+                    for (is_reset, mut client, response) in waiting_codex.drain(..)
+                    {
+                        if is_reset { thread::sleep(Duration::from_secs(14)); }
+                        client.write_all(response.as_bytes()).unwrap();
+                    }
+                    codex_done = true;
+                }
+            }
+            else { client.write_all(response.as_bytes()).unwrap(); }
             requests.push(first);
         }
         requests
@@ -124,7 +141,7 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
         ("HTTP_PROXY", "http://127.0.0.1:1".as_ref()), ("HTTPS_PROXY", "http://127.0.0.1:1".as_ref()),
         ("ALL_PROXY", "http://127.0.0.1:1".as_ref()), ("NO_PROXY", "".as_ref()),
         ("QUOTA_TEST_ORIGIN", origin.as_ref()),
-        ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex_usage,codex,dsh".as_ref()),
+        ("TOKEN_MONITOR_LITE_QUOTA_TOOLS", "codex,dsh".as_ref()),
         ("TOKEN_MONITOR_LITE_QUOTA_TRIGGER", "manual".as_ref()),
         ("TOKEN_MONITOR_LITE_CODEX_AUTH", auth.as_os_str()), ("DEEPSEEK_API_KEY", "deepseek-fixture".as_ref()),
     ], REMOTE_HELPER_TIMEOUT, &log);
@@ -138,13 +155,16 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
     fs::remove_dir(root).unwrap();
 
     let result = result.expect("quota helper JSON");
-    let quota = parse_online_codex(&result["providers"]["codex_usage"], 1_700_000_000_000).unwrap();
+    let usage = &result["providers"]["codex"]["usage"];
+    let observed_at = usage["observed_at"].as_i64().unwrap();
+    assert!(chrono::Utc::now().timestamp_millis() - observed_at >= 13_000);
+    let quota = parse_online_codex(usage, observed_at).unwrap();
     assert_eq!(quota.plan.as_deref(), Some("Pro 100"));
     assert_eq!(quota.windows.len(), 1);
     assert_eq!(quota.windows[0].minutes, Some(10_080));
     assert_eq!(quota.windows[0].remaining, 75.0);
     assert_eq!(requests.iter().filter(|line| line.starts_with("GET http://quota.invalid/usage ")).count(), 1);
-    assert_eq!(result["providers"]["codex_reset"]["available_count"], 3);
+    assert_eq!(result["providers"]["codex"]["reset"]["available_count"], 3);
     assert_eq!(result["providers"]["deepseek"]["balance_infos"][0]["total_balance"], "12.50");
     assert!(requests.iter().any(|line| line.starts_with("CONNECT quota.invalid:443 ")));
     assert_eq!(result["fallback"]["target"], "http://quota.invalid/fallback");
@@ -154,6 +174,7 @@ ConvertTo-Json -Depth 10 -InputObject @{ providers = $providers; fallback = $fal
     assert_eq!(result["bypassed"], "DIRECT");
     assert_eq!(result["unrelated"], proxy);
     assert_eq!(result["curl"]["available_count"], 3, "curl reply: {} (requests: {requests:?})", result["curl"]);
+    assert_eq!(trace.matches("codex_quota trigger=manual auth result=ready").count(), 1);
     for expected in ["route source=proxy-server", "client=winhttp proxy_scheme=http proxy_loopback=True",
         "winhttp phase=send timeout_ms=20000", "winhttp phase=wait", "http status=200",
         "response count_field=available_count count=3", "route source=HTTP_PROXY",
@@ -286,21 +307,22 @@ function Invoke-LiteHttpRequest([uri]$Uri, $Headers, [int]$TimeoutMs, [scriptblo
 $file = $env:TOKEN_MONITOR_LITE_CODEX_AUTH
 [Console]::Error.WriteLine('private-untagged-stderr')
 $env:TOKEN_MONITOR_LITE_CODEX_AUTH = $file + '.missing'
-$null = Get-CodexBankedReset
+$null = Get-CodexQuota
 $env:TOKEN_MONITOR_LITE_CODEX_AUTH = $file
 [IO.File]::WriteAllText($file, '{private-malformed-auth')
-$null = Get-CodexBankedReset
+$null = Get-CodexQuota
 [IO.File]::WriteAllText($file, '{"OPENAI_API_KEY":"private-key-fixture"}')
-$null = Get-CodexBankedReset
+$null = Get-CodexQuota
 [IO.File]::WriteAllText($file, '{"tokens":{"access_token":"private-token","account_id":"private-account"}}')
-foreach ($script:status in 0,401,403,429,503) { $null = Get-CodexBankedReset }
+$headers = Get-CodexHeaders
+foreach ($script:status in 0,401,403,429,503) { $null = Get-CodexBankedReset $headers }
 $script:status = 200
 foreach ($script:body in '', '{private-malformed-body', '{"message":"private-reply"}', '{"available_count":null}', '{"available_count":"private-value"}', '{"availableCount":0}')
 {
-    $null = Get-CodexBankedReset
+    $null = Get-CodexBankedReset $headers
 }
 $script:status = 403
-$usage = Get-CodexUsage
+$usage = Get-CodexUsage $headers
 if ($usage.error -ne 'no_usage_response') { throw 'Unexpected Codex usage result' }
 Write-Output 'true'
 "#;

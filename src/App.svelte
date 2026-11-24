@@ -178,7 +178,7 @@
       quotas = previous.cachedQuotas ?? null;
       lastQuotaCheck = quotas?.checkedAt ?? 0;
       ready = true;
-      loadViewExtras('panel');
+      loadViewExtras();
       if (route.period !== 'today') await backend.refresh(route.period);
       await refreshScreen();
       await tick();
@@ -191,11 +191,11 @@
     }
   }
 
-  function loadViewExtras(mode: QuotaRefresh = 'ifStale')
+  function loadViewExtras()
   {
     if (route.selection) return;
     if (route.view === 'home') void loadActivity();
-    if (quotaVisible) void loadQuotas(mode);
+    if (quotaVisible) void loadQuotas();
   }
 
   function localDay()

@@ -132,13 +132,26 @@ fn run(receiver: Receiver<Signal>, cache: &QuotaCache, store: &PreferencesStore,
         let tools = schedule.take(now, interval);
         if startup
         {
-            let codex_online = settings.quotas.tools.codex;
-            let result = if tools.any() || codex_online { "scheduled" } else { "no_enabled_tools" };
+            let quota_tools = settings.quotas.tools;
+            let result = if quota_tools.any() { "scheduled" } else { "no_enabled_tools" };
             cache.log.write(format_args!(
-                "quota startup result={result} codex_collection={} codex_quota={} antigravity_collection={} antigravity_quota={} refresh_minutes={} codex_online={codex_online} banked_reset=skipped_at_startup",
-                settings.collection.tools.codex, settings.quotas.tools.codex,
-                settings.collection.tools.antigravity, settings.quotas.tools.antigravity, settings.quotas.refresh_minutes));
-            cache.sample_startup(&sources, tools, codex_online.then(|| || cache.fetch_startup_codex(&sources)), &changed);
+                "quota startup result={result} codex_collection={} codex_quota={} antigravity_collection={} antigravity_quota={} dsh_quota={} refresh_minutes={}",
+                settings.collection.tools.codex, quota_tools.codex,
+                settings.collection.tools.antigravity, quota_tools.antigravity, quota_tools.dsh, settings.quotas.refresh_minutes));
+            thread::scope(|scope| {
+                // The first panel shares this refresh while the forecast indexes local history.
+                let refresh = quota_tools.any().then(|| scope.spawn(|| cache.read(&sources, settings.quotas, QuotaRefresh::Startup)));
+                if tools.any()
+                {
+                    cache.sample_local(&sources, tools, "startup", false);
+                    changed();
+                }
+                if let Some(refresh) = refresh
+                {
+                    refresh.join().expect("startup quota reader");
+                    changed();
+                }
+            });
             startup = false;
         }
         else if tools.any()
@@ -197,7 +210,8 @@ mod tests
         // No usage notification or panel request. The fixture isolates all provider calls.
         let published = std::cell::Cell::new(0);
         run(receiver, &cache, &store, Sources::from_home(Some(root.clone())), || published.set(published.get() + 1));
-        assert_eq!(published.get(), 2);
+        // Startup and both idle checks publish even within the panel's interval.
+        assert_eq!(published.get(), 3);
         assert!(cache.cached(settings.quotas.tools).unwrap().checked_at.is_some());
         std::fs::remove_file(root.join("settings.json")).unwrap();
         std::fs::remove_dir(root).unwrap();
